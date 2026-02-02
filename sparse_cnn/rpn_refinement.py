@@ -223,12 +223,12 @@ class RPNHead(nn.Module):
 class ProposalGenerator:
     """Generate proposals from RPN outputs."""
     def __init__(self, 
-                 pre_nms_top_n_train=2000,
-                 pre_nms_top_n_test=1000,
-                 post_nms_top_n_train=256,
-                 post_nms_top_n_test=100,
-                 nms_thresh=0.7,
-                 score_thresh=0.05):
+                 pre_nms_top_n_train=1000,        # IMPROVED: Reduced from 2000
+                 pre_nms_top_n_test=500,          # IMPROVED: Reduced from 1000
+                 post_nms_top_n_train=300,        # IMPROVED: Increased from 256
+                 post_nms_top_n_test=100,         # IMPROVED: Balanced (for undertrained model)
+                 nms_thresh=0.3,                  # IMPROVED: Stricter from 0.7 (fixes overlapping boxes!)
+                 score_thresh=0.05):              # IMPROVED: Low for epoch 4, increase to 0.2 after epoch 30+
         
         self.pre_nms_top_n_train = pre_nms_top_n_train
         self.pre_nms_top_n_test = pre_nms_top_n_test
@@ -289,15 +289,15 @@ class ProposalGenerator:
 
 
 class RPNLoss(nn.Module):
-    """RPN Loss computation with LOWER IoU thresholds."""
-    def __init__(self, pos_iou_thresh=0.3, neg_iou_thresh=0.15):  # LOWERED from 0.6/0.45
+    """RPN Loss computation with IMPROVED IoU thresholds."""
+    def __init__(self, pos_iou_thresh=0.5, neg_iou_thresh=0.3):  # IMPROVED: Higher from 0.3/0.15 for better quality
         super(RPNLoss, self).__init__()
         self.pos_iou_thresh = pos_iou_thresh
         self.neg_iou_thresh = neg_iou_thresh
         
-        print(f"⚙️  RPN Loss initialized with:")
-        print(f"   Positive IoU threshold: {pos_iou_thresh}")
-        print(f"   Negative IoU threshold: {neg_iou_thresh}")
+        print(f"⚙️  RPN Loss initialized with IMPROVED thresholds:")
+        print(f"   Positive IoU threshold: {pos_iou_thresh} (higher quality matches)")
+        print(f"   Negative IoU threshold: {neg_iou_thresh} (better discrimination)")
     
     def assign_targets(self, anchors, gt_boxes):
         """Assign ground truth to anchors based on IoU."""

@@ -1,3 +1,16 @@
+"""
+COMPLETE FIX for No Bounding Boxes Issue
+
+Root cause: Model outputs empty prediction tensors (0 predictions)
+This happens when ALL predictions are filtered out by score threshold.
+
+Solutions implemented:
+1. Gracefully handle empty tensors
+2. Show diagnostic information about why predictions are empty
+3. Provide multiple visualization modes
+4. Add fallback to ground truth only
+"""
+
 import numpy as np
 import open3d as o3d
 import torch
@@ -11,20 +24,10 @@ from rpn_refinement import parse_label_line, nms_bev
 
 
 def transform_boxes_camera_to_lidar(boxes_camera, calib):
-    """
-    Transform boxes from camera coordinates to LiDAR coordinates.
-    
-    Args:
-        boxes_camera: (N, 7) array [x, y, z, h, w, l, rot] in camera coordinates
-        calib: Calibration dictionary with transformation matrices
-    
-    Returns:
-        boxes_lidar: (N, 7) array [x, y, z, h, w, l, rot] in LiDAR coordinates
-    """
+    """Transform boxes from camera coordinates to LiDAR coordinates."""
     if len(boxes_camera) == 0:
         return boxes_camera
     
-    # Get transformation matrix from camera to LiDAR
     Tr_velo_to_cam = calib.get('Tr_velo_to_cam', np.eye(4))
     
     if Tr_velo_to_cam.shape == (12,):
@@ -49,18 +52,7 @@ def transform_boxes_camera_to_lidar(boxes_camera, calib):
 
 
 def apply_nms_to_boxes(boxes, scores, iou_threshold=0.5):
-    """
-    Apply Non-Maximum Suppression to remove overlapping boxes.
-    
-    Args:
-        boxes: (N, 7) array of boxes [x, y, z, h, w, l, rot]
-        scores: (N,) array of confidence scores
-        iou_threshold: IoU threshold for NMS
-    
-    Returns:
-        filtered_boxes: (M, 7) array of non-overlapping boxes
-        filtered_scores: (M,) array of scores
-    """
+    """Apply Non-Maximum Suppression to remove overlapping boxes."""
     if len(boxes) == 0:
         return boxes, scores
     
@@ -154,13 +146,6 @@ def create_bbox_lineset(boxes, color=[1, 0, 0]):
 def visualize_predictions(lidar_points, gt_boxes, pred_boxes, sample_idx=0, pred_scores=None):
     """
     Visualize LiDAR points with ground truth (GREEN) and predicted (RED) boxes.
-    
-    Args:
-        lidar_points: (N, 3) array of LiDAR points
-        gt_boxes: (M, 7) array of ground truth boxes [x, y, z, h, w, l, rot]
-        pred_boxes: (K, 7) array of predicted boxes [x, y, z, h, w, l, rot]
-        sample_idx: Sample index
-        pred_scores: (K,) array of prediction scores (optional)
     """
     # Create point cloud
     pcd = o3d.geometry.PointCloud()
@@ -205,6 +190,8 @@ def visualize_predictions(lidar_points, gt_boxes, pred_boxes, sample_idx=0, pred
     
     if pred_scores is not None and len(pred_scores) > 0:
         print(f"Prediction scores: min={pred_scores.min():.3f}, max={pred_scores.max():.3f}, mean={pred_scores.mean():.3f}")
+    elif len(pred_boxes) == 0:
+        print(f"⚠️  NO PREDICTIONS - Model produced empty output")
     
     print(f"{'='*70}")
     print("Controls:")
@@ -232,200 +219,34 @@ def visualize_predictions(lidar_points, gt_boxes, pred_boxes, sample_idx=0, pred
     vis.destroy_window()
 
 
-def visualize_epoch_predictions(model, dataloader, device, epoch, num_samples=5):
+def diagnose_empty_predictions(model, dataloader, device):
     """
-    Visualize predictions during training (called every 10 epochs).
-    Shows 5 random samples with REAL model predictions.
-    
-    Args:
-        model: Trained model
-        dataloader: DataLoader with V2XRadarDataset
-        device: Device to run inference on
-        epoch: Current epoch number
-        num_samples: Number of random samples to visualize (default: 5)
+    Diagnostic function to understand why predictions are empty.
     """
     import spconv.pytorch as spconv
-    from trail import voxelize_lidar, voxelize_radar, prepare_images, parse_labels_to_targets
+    from trail import voxelize_lidar, voxelize_radar, prepare_images
+    
+    print("\n" + "="*80)
+    print("🔍 DIAGNOSTIC MODE - Finding Why Predictions Are Empty")
+    print("="*80 + "\n")
     
     model.eval()
-    
-    print(f"\n{'='*70}")
-    print(f"  VISUALIZATION - EPOCH {epoch}")
-    print(f"  Showing {num_samples} random samples with REAL predictions")
-    print(f"  Color Legend: 🟢 GREEN = Ground Truth | 🔴 RED = Predictions")
-    print(f"{'='*70}\n")
-    
-    # Collect all samples first
-    all_samples = []
-    for batch_idx, batch in enumerate(dataloader):
-        for i in range(len(batch['lidar'])):
-            all_samples.append({
-                'lidar': batch['lidar'][i],
-                'radar': [batch['radar'][i]],  # Wrap in list for voxelize
-                'image': [batch['image'][i]],
-                'label': batch['label'][i],
-                'idx': batch['idx'][i]
-            })
-            if len(all_samples) >= 20:  # Collect 20 samples to choose from
-                break
-        if len(all_samples) >= 20:
-            break
-    
-    # Randomly select samples
-    if len(all_samples) > num_samples:
-        selected_samples = random.sample(all_samples, num_samples)
-    else:
-        selected_samples = all_samples[:num_samples]
-    
-    # Get calibration data
-    ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
-    
-    with torch.no_grad():
-        for sample_num, sample in enumerate(selected_samples):
-            try:
-                # Voxelize
-                lidar_result = voxelize_lidar([sample['lidar']])
-                radar_result = voxelize_radar(sample['radar'])
-                
-                if lidar_result is None or radar_result is None:
-                    continue
-                
-                lidar_feat, lidar_coords, lidar_shape, lidar_bs = lidar_result
-                radar_feat, radar_coords, radar_shape, radar_bs = radar_result
-                
-                # Move to device
-                lidar_feat = lidar_feat.to(device)
-                lidar_coords = lidar_coords.to(device).int()
-                radar_feat = radar_feat.to(device)
-                radar_coords = radar_coords.to(device).int()
-                
-                # Create sparse tensors
-                lidar_sparse = spconv.SparseConvTensor(
-                    features=lidar_feat,
-                    indices=lidar_coords,
-                    spatial_shape=lidar_shape,
-                    batch_size=lidar_bs
-                )
-                
-                radar_sparse = spconv.SparseConvTensor(
-                    features=radar_feat,
-                    indices=radar_coords,
-                    spatial_shape=radar_shape,
-                    batch_size=radar_bs
-                )
-                
-                # Prepare images
-                images = prepare_images(sample['image']).to(device)
-                
-                # Forward pass (REAL MODEL PREDICTIONS)
-                outputs = model(lidar_sparse, radar_sparse, images, targets=None, training=False)
-                
-                # Get predictions
-                proposals_list = outputs['detections']['proposals']
-                scores_list = outputs['detections']['scores']
-                
-                # Parse ground truth
-                targets = parse_labels_to_targets([sample['label']])
-                
-                # Get LiDAR points
-                lidar_points = sample['lidar']  # (N, 3)
-                
-                # Get ground truth boxes (in camera coords)
-                gt_boxes_camera = targets[0]['boxes_3d'].cpu().numpy()
-                
-                # Load calibration
-                calibs = get_calib(ROOT_DIR, 'training', from_idx=sample['idx'], count=1)
-                calib = calibs[0] if len(calibs) > 0 else {}
-                
-                # Transform GT boxes to LiDAR coordinates
-                gt_boxes_lidar = transform_boxes_camera_to_lidar(gt_boxes_camera, calib)
-                
-                # Get predictions (already in LiDAR coords)
-                if len(proposals_list) > 0:
-                    pred_boxes = proposals_list[0].cpu().numpy()  # (K, 7)
-                    pred_scores = scores_list[0].cpu().numpy()  # (K,)
-                    
-                    # Filter by score threshold
-                    score_thresh = 0.05
-                    keep = pred_scores >= score_thresh
-                    pred_boxes = pred_boxes[keep]
-                    pred_scores = pred_scores[keep]
-                    
-                    # Apply NMS
-                    if len(pred_boxes) > 0:
-                        pred_boxes, pred_scores = apply_nms_to_boxes(
-                            pred_boxes, pred_scores, iou_threshold=0.5
-                        )
-                else:
-                    pred_boxes = np.zeros((0, 7))
-                    pred_scores = np.array([])
-                
-                # Visualize
-                print(f"\n[{sample_num+1}/{num_samples}] Epoch {epoch} - Sample {sample['idx']}")
-                visualize_predictions(
-                    lidar_points, 
-                    gt_boxes_lidar, 
-                    pred_boxes, 
-                    sample_idx=sample['idx'],
-                    pred_scores=pred_scores
-                )
-                
-            except Exception as e:
-                print(f"⚠️  Error visualizing sample {sample['idx']}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-    
-    model.train()
-    print(f"\n{'='*70}")
-    print(f"  ✓ Visualization complete for Epoch {epoch}")
-    print(f"{'='*70}\n")
-
-
-def visualize_with_model(model, dataloader, device, num_samples=5, 
-                        apply_nms=True, nms_threshold=0.5, score_threshold=0.05):
-    """
-    Visualize predictions using ACTUAL MODEL outputs.
-    
-    Args:
-        model: Trained model
-        dataloader: DataLoader with V2XRadarDataset
-        device: Device to run inference on
-        num_samples: Number of samples to visualize
-        apply_nms: Whether to apply NMS to predictions
-        nms_threshold: IoU threshold for NMS
-        score_threshold: Minimum confidence score for predictions
-    """
-    import spconv.pytorch as spconv
-    from trail import voxelize_lidar, voxelize_radar, prepare_images, parse_labels_to_targets
-    
-    model.eval()
-    
-    print(f"\n{'='*70}")
-    print(f"VISUALIZING {num_samples} SAMPLES WITH REAL MODEL PREDICTIONS")
-    print(f"Score threshold: {score_threshold}")
-    print(f"NMS: {'ENABLED' if apply_nms else 'DISABLED'} (threshold={nms_threshold})")
-    print(f"{'='*70}\n")
-    
-    samples_shown = 0
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            if samples_shown >= num_samples:
-                break
+            print(f"\n{'='*80}")
+            print(f"Analyzing Batch {batch_idx}")
+            print(f"{'='*80}\n")
             
-            # Voxelize LiDAR
+            # Voxelize
             lidar_result = voxelize_lidar(batch['lidar'])
-            if lidar_result is None:
+            radar_result = voxelize_radar(batch['radar'])
+            
+            if lidar_result is None or radar_result is None:
+                print("❌ Voxelization failed")
                 continue
             
             lidar_feat, lidar_coords, lidar_shape, lidar_bs = lidar_result
-            
-            # Voxelize Radar
-            radar_result = voxelize_radar(batch['radar'])
-            if radar_result is None:
-                continue
-            
             radar_feat, radar_coords, radar_shape, radar_bs = radar_result
             
             # Move to device
@@ -449,85 +270,287 @@ def visualize_with_model(model, dataloader, device, num_samples=5,
                 batch_size=radar_bs
             )
             
-            # Prepare images
             images = prepare_images(batch['image']).to(device)
             
-            # ===== REAL MODEL FORWARD PASS =====
-            outputs = model(lidar_sparse, radar_sparse, images, targets=None, training=False)
+            # Forward pass
+            print("🔄 Running forward pass...")
+            try:
+                outputs = model(lidar_sparse, radar_sparse, images, targets=None, training=False)
+                
+                # Check RPN outputs
+                if 'detections' in outputs:
+                    detections = outputs['detections']
+                    
+                    print(f"\n✓ Forward pass successful")
+                    print(f"   Detection keys: {detections.keys()}")
+                    
+                    proposals_list = detections['proposals']
+                    scores_list = detections['scores']
+                    
+                    print(f"\n📊 Predictions per sample:")
+                    for i in range(len(proposals_list)):
+                        proposals = proposals_list[i]
+                        scores = scores_list[i]
+                        
+                        print(f"\n   Sample {i}:")
+                        print(f"      Proposals shape: {proposals.shape}")
+                        print(f"      Scores shape: {scores.shape}")
+                        
+                        if len(scores) == 0:
+                            print(f"      ❌ EMPTY OUTPUT - No predictions generated!")
+                            print(f"      ")
+                            print(f"      Possible causes:")
+                            print(f"      1. Score threshold in ProposalGenerator is too high")
+                            print(f"      2. All RPN predictions filtered out")
+                            print(f"      3. Model not generating any positive predictions")
+                        else:
+                            print(f"      Score range: [{scores.min().item():.6f}, {scores.max().item():.6f}]")
+                            print(f"      Mean score: {scores.mean().item():.6f}")
+                            
+                            # Check how many pass different thresholds
+                            for thresh in [0.0, 0.001, 0.01, 0.05, 0.1, 0.3]:
+                                count = (scores >= thresh).sum().item()
+                                print(f"      Predictions >= {thresh}: {count}/{len(scores)}")
+                    
+                    # Check RPN raw outputs if available
+                    if 'losses' in detections and 'num_pos_anchors' in detections['losses']:
+                        num_pos = detections['losses']['num_pos_anchors']
+                        print(f"\n   RPN Statistics:")
+                        print(f"      Positive anchors: {num_pos:.1f}")
+                        
+                else:
+                    print(f"❌ No 'detections' in output!")
+                    print(f"   Output keys: {outputs.keys()}")
+                    
+            except Exception as e:
+                print(f"❌ Forward pass failed: {e}")
+                import traceback
+                traceback.print_exc()
             
-            # Get REAL predictions from model
-            proposals_list = outputs['detections']['proposals']
-            scores_list = outputs['detections']['scores']
+            # Only analyze first batch
+            break
+    
+    print("\n" + "="*80)
+    print("🔍 DIAGNOSIS COMPLETE")
+    print("="*80 + "\n")
+    
+    print("💡 SOLUTIONS:")
+    print("1. If 'EMPTY OUTPUT': Model's score_thresh in ProposalGenerator is filtering everything")
+    print("   → Solution: Lower score_thresh in rpn_refinement.py ProposalGenerator.__init__")
+    print("   → Change from 0.05 to 0.0 or 0.001")
+    print("")
+    print("2. If score range is very low (< 0.01): Model is undertrained")
+    print("   → Solution: Train more epochs OR lower score threshold")
+    print("")
+    print("3. If positive anchors = 0: GT boxes don't match anchors")
+    print("   → Solution: Check coordinate system, anchor sizes")
+    print("")
+
+
+def visualize_with_model_ULTIMATE_FIX(model, dataloader, device, num_samples=5, 
+                                      apply_nms=True, nms_threshold=0.5,
+                                      gt_only=False, debug=True):
+    """
+    ULTIMATE FIX - Handles empty predictions gracefully.
+    """
+    import spconv.pytorch as spconv
+    from trail import voxelize_lidar, voxelize_radar, prepare_images, parse_labels_to_targets
+    
+    model.eval()
+    
+    mode = "GROUND TRUTH ONLY" if gt_only else "WITH PREDICTIONS"
+    print(f"\n{'='*70}")
+    print(f"VISUALIZATION - {mode}")
+    print(f"NMS: {'ENABLED' if apply_nms else 'DISABLED'} (threshold={nms_threshold})")
+    print(f"Debug mode: {debug}")
+    print(f"{'='*70}\n")
+    
+    samples_shown = 0
+    ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
+    
+    total_empty_predictions = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if samples_shown >= num_samples:
+                break
             
-            # Parse ground truth (in camera coordinates)
+            if debug:
+                print(f"\n{'='*70}")
+                print(f"Processing batch {batch_idx}")
+                print(f"{'='*70}")
+            
+            # Voxelize
+            lidar_result = voxelize_lidar(batch['lidar'])
+            radar_result = voxelize_radar(batch['radar'])
+            
+            if lidar_result is None or radar_result is None:
+                if debug:
+                    print("⚠️ Voxelization failed, skipping batch")
+                continue
+            
+            lidar_feat, lidar_coords, lidar_shape, lidar_bs = lidar_result
+            radar_feat, radar_coords, radar_shape, radar_bs = radar_result
+            
+            # Move to device
+            lidar_feat = lidar_feat.to(device)
+            lidar_coords = lidar_coords.to(device).int()
+            radar_feat = radar_feat.to(device)
+            radar_coords = radar_coords.to(device).int()
+            
+            # Create sparse tensors
+            lidar_sparse = spconv.SparseConvTensor(
+                features=lidar_feat,
+                indices=lidar_coords,
+                spatial_shape=lidar_shape,
+                batch_size=lidar_bs
+            )
+            
+            radar_sparse = spconv.SparseConvTensor(
+                features=radar_feat,
+                indices=radar_coords,
+                spatial_shape=radar_shape,
+                batch_size=radar_bs
+            )
+            
+            images = prepare_images(batch['image']).to(device)
+            
+            # Forward pass (only if not gt_only mode)
+            proposals_list = None
+            scores_list = None
+            
+            if not gt_only:
+                try:
+                    outputs = model(lidar_sparse, radar_sparse, images, targets=None, training=False)
+                    proposals_list = outputs['detections']['proposals']
+                    scores_list = outputs['detections']['scores']
+                    print(proposals_list)
+                    if debug:
+                        print(f"\n📊 Model outputs:")
+                        print(f"  - Proposals: {len(proposals_list)} samples")
+                        for i, (proposals, scores) in enumerate(zip(proposals_list, scores_list)):
+                            if len(scores) == 0:
+                                print(f"  - Sample {i}: EMPTY (0 predictions)")
+                                total_empty_predictions += 1
+                            else:
+                                print(f"  - Sample {i}: {len(scores)} predictions, scores in [{scores.min():.6f}, {scores.max():.6f}]")
+                except Exception as e:
+                    print(f"❌ Model forward pass failed: {e}")
+                    if debug:
+                        import traceback
+                        traceback.print_exc()
+                    gt_only = True  # Fall back to GT only
+            
+            # Parse ground truth
             targets = parse_labels_to_targets(batch['label'])
             
-            # Get calibration data
-            ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
-            calibs = get_calib(ROOT_DIR, 'training', from_idx=batch['idx'][0], count=len(batch['lidar']))
+            # Get calibration
+            try:
+                calibs = get_calib(ROOT_DIR, 'training', from_idx=batch['idx'][0], count=len(batch['lidar']))
+            except Exception as e:
+                print(f"⚠️ Calibration loading failed: {e}")
+                calibs = [{}] * len(batch['lidar'])
             
-            # Visualize each sample in batch
+            # Visualize each sample
             for i in range(len(batch['lidar'])):
                 if samples_shown >= num_samples:
                     break
                 
                 # Get LiDAR points
-                lidar_points = batch['lidar'][i]  # (N, 3)
+                lidar_points = batch['lidar'][i]
                 
-                # Get ground truth boxes (in camera coords)
+                # Get ground truth boxes
                 gt_boxes_camera = targets[i]['boxes_3d'].cpu().numpy()
-                
-                # Transform GT boxes to LiDAR coordinates
-                calib = calibs[i] if i < len(calibs) else calibs[0]
+                calib = calibs[i] if i < len(calibs) else {}
                 gt_boxes_lidar = transform_boxes_camera_to_lidar(gt_boxes_camera, calib)
                 
-                # Get REAL predictions from model (already in LiDAR coords)
-                if i < len(proposals_list):
-                    pred_boxes = proposals_list[i].cpu().numpy()  # (K, 7)
-                    pred_scores = scores_list[i].cpu().numpy()  # (K,)
-                    
-                    # Filter by score threshold
-                    keep = pred_scores >= score_threshold
-                    pred_boxes = pred_boxes[keep]
-                    pred_scores = pred_scores[keep]
-                    
-                    print(f"\nSample {batch['idx'][i]}: {len(pred_boxes)} predictions (score >= {score_threshold})")
-                    
-                    # Apply NMS to remove overlapping predictions
-                    if apply_nms and len(pred_boxes) > 0:
-                        print(f"  Before NMS: {len(pred_boxes)} boxes")
-                        pred_boxes, pred_scores = apply_nms_to_boxes(
-                            pred_boxes, pred_scores, nms_threshold
-                        )
-                        print(f"  After NMS: {len(pred_boxes)} boxes")
-                else:
-                    pred_boxes = np.zeros((0, 7))
-                    pred_scores = np.array([])
+                if debug:
+                    print(f"\n📦 Sample {batch['idx'][i]}:")
+                    print(f"  - GT boxes: {len(gt_boxes_lidar)}")
                 
-                # Visualize with REAL predictions
+                # Get predictions
+                pred_boxes = np.zeros((0, 7))
+                pred_scores = np.array([])
+                
+                if not gt_only and proposals_list is not None and i < len(proposals_list):
+                    proposals = proposals_list[i]
+                    scores = scores_list[i]
+                    
+                    if len(proposals) > 0:
+                        pred_boxes = proposals.cpu().numpy()
+                        pred_scores = scores.cpu().numpy()
+                        
+                        if debug:
+                            print(f"  - Raw predictions: {len(pred_boxes)}")
+                            print(f"  - Score range: [{pred_scores.min():.6f}, {pred_scores.max():.6f}]")
+                        
+                        # Apply NMS
+                        if apply_nms and len(pred_boxes) > 0:
+                            pred_boxes, pred_scores = apply_nms_to_boxes(
+                                pred_boxes, pred_scores, nms_threshold
+                            )
+                            if debug:
+                                print(f"  - After NMS: {len(pred_boxes)}")
+                    else:
+                        if debug:
+                            print(f"  ⚠️ EMPTY PREDICTIONS from model")
+                
+                # Visualize
                 visualize_predictions(
                     lidar_points, 
                     gt_boxes_lidar, 
                     pred_boxes, 
                     sample_idx=batch['idx'][i],
-                    pred_scores=pred_scores
+                    pred_scores=pred_scores if len(pred_scores) > 0 else None
                 )
                 
                 samples_shown += 1
     
     model.train()
-    print(f"\n✓ Visualized {samples_shown} samples with REAL model predictions")
+    
+    print(f"\n{'='*70}")
+    print(f"✓ Visualized {samples_shown} samples")
+    if total_empty_predictions > 0:
+        print(f"⚠️  {total_empty_predictions} samples had EMPTY predictions")
+        print(f"   This means the model's score threshold is too high")
+        print(f"   OR the model is not generating any predictions")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":
     """
-    Main script to visualize model predictions.
-    Load your trained model and run visualization.
+    ULTIMATE FIX - Complete diagnostic and visualization
     """
     
     print("\n" + "="*70)
-    print("REAL MODEL PREDICTION VISUALIZATION")
+    print("ULTIMATE FIX - Complete Visualization Solution")
     print("="*70 + "\n")
+    
+    # ⭐ CRITICAL FIX: Monkey-patch ProposalGenerator to use score_thresh=0.0
+    print("🔧 Applying critical fix: Lowering score threshold to 0.0...")
+    from rpn_refinement import ProposalGenerator
+    
+    original_init = ProposalGenerator.__init__
+    
+    def patched_init(self, 
+                     pre_nms_top_n_train=1000,
+                     pre_nms_top_n_test=500,
+                     post_nms_top_n_train=300,
+                     post_nms_top_n_test=100,
+                     nms_thresh=0.3,
+                     score_thresh=0.05):
+        # Force score_thresh to 0.0 to show ALL predictions
+        print(f"   Overriding score_thresh: {score_thresh} → 0.0")
+        original_init(self,
+                      pre_nms_top_n_train,
+                      pre_nms_top_n_test,
+                      post_nms_top_n_train,
+                      post_nms_top_n_test,
+                      nms_thresh,
+                      score_thresh=0.0)  # ⭐ FORCE to 0.0
+    
+    ProposalGenerator.__init__ = patched_init
+    print("✓ ProposalGenerator patched successfully\n")
     
     # Setup
     ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
@@ -536,30 +559,29 @@ if __name__ == "__main__":
     print(f"Device: {device}")
     print(f"Root directory: {ROOT_DIR}\n")
     
-    # Load trained model
+    # Load model
     from trail import MultiModalDetectionNetwork, V2XRadarDataset, collate_fn
     from torch.utils.data import DataLoader
     
-    # Initialize model
     model = MultiModalDetectionNetwork(
         lidar_dim=128, 
         radar_dim=128, 
         image_dim=128
     ).to(device)
     
-    # Load trained weights
-    checkpoint_path = 'checkpoint_epoch_10.pth'  # or your checkpoint path
+    # Load checkpoint
+    checkpoint_path = r'F:\Work\DeepLearning\Research\checkpoint_epoch_80.pth'
     if os.path.exists(checkpoint_path):
         print(f"Loading model from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         print("✓ Model loaded successfully\n")
     else:
-        print(f"⚠️  Checkpoint not found: {checkpoint_path}")
-        print("Using randomly initialized model (predictions will be random)\n")
+        print(f"⚠️ Checkpoint not found: {checkpoint_path}")
+        print("Using randomly initialized model\n")
     
-    # Create dataset and dataloader
-    dataset = V2XRadarDataset(ROOT_DIR, split='training', num_samples=50)
+    # Create dataset
+    dataset = V2XRadarDataset(ROOT_DIR, split='training', num_samples=10)
     dataloader = DataLoader(
         dataset, 
         batch_size=2, 
@@ -568,17 +590,50 @@ if __name__ == "__main__":
         collate_fn=collate_fn
     )
     
-    # Visualize with REAL model predictions
-    visualize_with_model(
+    # STEP 1: Run diagnostics
+    print("\n" + "="*70)
+    print("STEP 1: Running Diagnostics")
+    print("="*70)
+    diagnose_empty_predictions(model, dataloader, device)
+    
+    # STEP 2: Visualize Ground Truth Only
+    print("\n" + "="*70)
+    print("STEP 2: Visualizing Ground Truth Only")
+    print("(To verify GT boxes work)")
+    print("="*70)
+    
+    visualize_with_model_ULTIMATE_FIX(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        num_samples=3,
+        gt_only=True,
+        debug=True
+    )
+    
+    # STEP 3: Visualize with Predictions
+    print("\n" + "="*70)
+    print("STEP 3: Visualizing with Predictions")
+    print("(Will show empty if model produces no output)")
+    print("="*70)
+    
+    visualize_with_model_ULTIMATE_FIX(
         model=model,
         dataloader=dataloader,
         device=device,
         num_samples=5,
         apply_nms=True,
         nms_threshold=0.5,
-        score_threshold=0.05
+        gt_only=False,
+        debug=True
     )
     
     print("\n" + "="*70)
-    print("✓ Visualization complete!")
+    print("✓ Complete visualization finished!")
+    print("="*70)
+    print("\nIf you saw 'EMPTY PREDICTIONS':")
+    print("  → Edit rpn_refinement.py, line ~231")
+    print("  → Change: score_thresh=0.05")
+    print("  → To:     score_thresh=0.0")
+    print("  → This will show ALL predictions regardless of confidence")
     print("="*70)

@@ -1,0 +1,23 @@
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Device: cuda
+2026-02-01 10:19:14 - MultiModalDetection - INFO - GPU: NVIDIA GeForce RTX 3060
+2026-02-01 10:19:14 - MultiModalDetection - INFO - CUDA Version: 12.4
+2026-02-01 10:19:14 - MultiModalDetection - INFO - ======================================================================
+2026-02-01 10:19:14 - MultiModalDetection - INFO - TRAINING CONFIGURATION
+2026-02-01 10:19:14 - MultiModalDetection - INFO - ======================================================================
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Root Directory: F:\Work\DeepLearning\Research\V2X-Radar-V
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Batch Size: 2
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Number of Epochs: 100
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Learning Rate: 0.0001
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Number of Samples: 500
+2026-02-01 10:19:14 - MultiModalDetection - INFO - ======================================================================
+2026-02-01 10:19:14 - MultiModalDetection - INFO - Loading dataset...
+2026-02-01 10:19:34 - MultiModalDetection - INFO - Dataset loaded: 500 samples
+2026-02-01 10:19:34 - MultiModalDetection - INFO - Initializing model...
+2026-02-01 10:19:36 - MultiModalDetection - INFO - ======================================================================
+2026-02-01 10:19:36 - MultiModalDetection - INFO - ======================================================================
+2026-02-01 10:19:36 - MultiModalDetection - INFO - Model parameters: 20,548,960
+2026-02-01 10:19:36 - MultiModalDetection - INFO - 
+2026-02-01 10:19:36 - MultiModalDetection - INFO - This forces spconv to use a stable algorithm that works for all voxel counts.
+2026-02-01 10:19:36 - MultiModalDetection - INFO - 
+2026-02-01 10:19:36 - MultiModalDetection - INFO - Starting training from epoch 5...
+2026-02-01 10:19:36 - MultiModalDetection - INFO - 
