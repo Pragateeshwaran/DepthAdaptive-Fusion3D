@@ -113,7 +113,7 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
 
 def voxelize_lidar_proper(points_batch, 
                           voxel_size=(0.1, 0.1, 0.1),  # Original resolution
-                          point_cloud_range=(-50, -50, -3, 50, 50, 5)):  # Original range
+                          point_cloud_range=(-192, -98, -5, 189, 117, 10)):  # Original range
     """
     PROPER voxelization - NO downsampling, NO limits.
     Uses efficient numpy operations to handle all points.
@@ -200,7 +200,7 @@ def voxelize_lidar_proper(points_batch,
 
 def voxelize_radar_proper(points_batch, 
                           voxel_size=(0.2, 0.2, 0.2),  # Original resolution
-                          point_cloud_range=(-50, -50, -3, 50, 50, 5)):
+                          point_cloud_range=(-192, -98, -5, 189, 117, 10)):
     """PROPER radar voxelization - NO downsampling, NO limits."""
     spatial_shape = [
         int((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]),

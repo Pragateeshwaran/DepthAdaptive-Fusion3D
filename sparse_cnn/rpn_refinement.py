@@ -155,13 +155,15 @@ class AnchorGenerator:
         else:
             H, W = self.feature_map_size
         
-        # Create grid centers
+        # Create grid centers in WORLD coordinates
         x_range = torch.linspace(self.point_cloud_range[0], 
                                 self.point_cloud_range[3], W, device=device)
         y_range = torch.linspace(self.point_cloud_range[1], 
                                 self.point_cloud_range[4], H, device=device)
         
-        y_grid, x_grid = torch.meshgrid(y_range, x_range, indexing='ij')
+        # FIX: Use 'xy' indexing - X varies along width, Y along height
+        # This matches LiDAR convention: X=forward, Y=left
+        x_grid, y_grid = torch.meshgrid(x_range, y_range, indexing='xy')
         z_centers = torch.full_like(x_grid, -1.0)  # Ground height
         
         anchors_list = []
@@ -239,7 +241,7 @@ class ProposalGenerator:
                  post_nms_top_n_train=300,
                  post_nms_top_n_test=100,
                  nms_thresh=0.3,
-                 score_thresh=0.01):              # FIX: Lowered to 0.01 for debugging (was 0.05)
+                 score_thresh=0.0001):              # FIX: Lowered to 0.01 for debugging (was 0.05)
         
         self.pre_nms_top_n_train = pre_nms_top_n_train
         self.pre_nms_top_n_test = pre_nms_top_n_test
