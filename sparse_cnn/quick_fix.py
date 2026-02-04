@@ -1,317 +1,206 @@
 """
-Quick Fix Script - Apply Immediate Improvements
-
-This script patches your existing files with immediate fixes for:
-1. Overlapping boxes (stricter NMS)
-2. Better training configuration
-
-Run this before continuing training!
+Diagnose Coordinate Transformation Issue
+This will show you EXACTLY where the boxes are before and after transformation
 """
-
+import sys
 import os
-import shutil
-from datetime import datetime
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+import numpy as np
+import torch
+from data_loader import get_labels, get_calib
+from rpn_refinement import parse_label_line, AnchorGenerator, bev_iou
 
-def backup_file(filepath):
-    """Create timestamped backup of a file."""
-    if not os.path.exists(filepath):
-        return None
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = f"{filepath}.backup_{timestamp}"
-    shutil.copy2(filepath, backup_path)
-    return backup_path
+ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
 
+print("="*80)
+print("COORDINATE TRANSFORMATION DIAGNOSTIC")
+print("="*80)
 
-def patch_rpn_refinement(filepath="rpn_refinement.py"):
-    """
-    Patch rpn_refinement.py with stricter NMS parameters.
+# Load first sample
+labels = get_labels(ROOT_DIR, 'training', from_idx=0, count=1)
+calibs = get_calib(ROOT_DIR, 'training', from_idx=0, count=1)
+
+if len(labels) == 0 or len(calibs) == 0:
+    print("ERROR: No data loaded!")
+    exit(1)
+
+calib = calibs[0]
+label_lines = labels[0]
+
+print(f"\n📋 Calibration Info:")
+print(f"   Keys: {list(calib.keys())}")
+print(f"   Tr_velo_to_cam shape: {calib['Tr_velo_to_cam'].shape}")
+print(f"   Tr_velo_to_cam:\n{calib['Tr_velo_to_cam']}")
+
+# Parse labels
+class_map = {'pedestrian': 0, 'cyclist': 1, 'car': 2}
+boxes_camera = []
+for line in label_lines:
+    if isinstance(line, str) and line.strip():
+        parsed = parse_label_line(line)
+        obj_type = parsed['type'].lower()
+        if obj_type in class_map:
+            box_3d = parsed['location'] + parsed['dimensions'] + [parsed['rotation_y']]
+            boxes_camera.append(box_3d)
+
+boxes_camera = np.array(boxes_camera)
+
+print(f"\n📦 BOXES IN CAMERA COORDINATES:")
+print(f"   Number of boxes: {len(boxes_camera)}")
+if len(boxes_camera) > 0:
+    print(f"\n   Box format: [x, y, z, h, w, l, rot]")
+    for i, box in enumerate(boxes_camera):
+        print(f"   Box {i}: x={box[0]:6.2f}, y={box[1]:6.2f}, z={box[2]:6.2f}, "
+              f"h={box[3]:4.2f}, w={box[4]:4.2f}, l={box[5]:4.2f}, rot={box[6]:5.3f}")
     
-    Changes:
-    - NMS threshold: 0.5 → 0.3
-    - Score threshold: 0.05 → 0.2
-    - Reduce number of proposals
-    """
-    print(f"\n{'='*70}")
-    print(f"PATCHING: {filepath}")
-    print(f"{'='*70}")
+    print(f"\n   Camera coordinate ranges:")
+    print(f"   X: [{boxes_camera[:, 0].min():6.2f}, {boxes_camera[:, 0].max():6.2f}]")
+    print(f"   Y: [{boxes_camera[:, 1].min():6.2f}, {boxes_camera[:, 1].max():6.2f}]")
+    print(f"   Z: [{boxes_camera[:, 2].min():6.2f}, {boxes_camera[:, 2].max():6.2f}]")
+
+# Now transform to LiDAR
+def transform_boxes_camera_to_lidar(boxes_camera, calib):
+    """Transform boxes from camera coordinates to LiDAR coordinates."""
+    if len(boxes_camera) == 0:
+        return boxes_camera
     
-    if not os.path.exists(filepath):
-        print(f"❌ File not found: {filepath}")
-        return False
+    Tr_velo_to_cam = calib.get('Tr_velo_to_cam', np.eye(4))
     
-    # Backup
-    backup = backup_file(filepath)
-    print(f"✓ Backup created: {backup}")
+    if Tr_velo_to_cam.shape == (12,):
+        Tr_velo_to_cam = Tr_velo_to_cam.reshape(3, 4)
+        Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
     
-    # Read file
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
+    Tr_cam_to_velo = np.linalg.inv(Tr_velo_to_cam)
     
-    # Apply patches
-    patches_applied = 0
+    print(f"\n🔄 Transformation Matrix (Cam to Velo):")
+    print(Tr_cam_to_velo)
     
-    # Patch 1: ProposalGenerator NMS threshold
-    if "nms_thresh=0.5" in content:
-        content = content.replace(
-            "nms_thresh=0.5",
-            "nms_thresh=0.3  # ✓ PATCHED: Stricter NMS"
-        )
-        patches_applied += 1
-        print("✓ Patch 1: NMS threshold 0.5 → 0.3")
+    boxes_lidar = boxes_camera.copy()
     
-    # Patch 2: ProposalGenerator score threshold
-    if "score_thresh=0.05" in content:
-        content = content.replace(
-            "score_thresh=0.05",
-            "score_thresh=0.2  # ✓ PATCHED: Higher confidence"
-        )
-        patches_applied += 1
-        print("✓ Patch 2: Score threshold 0.05 → 0.2")
+    for i in range(len(boxes_camera)):
+        x_cam, y_cam, z_cam = boxes_camera[i, 0:3]
+        point_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        point_lidar = Tr_cam_to_velo @ point_cam
+        boxes_lidar[i, 0:3] = point_lidar[:3]
+        
+        rot_cam = boxes_camera[i, 6]
+        rot_lidar = -rot_cam - np.pi / 2
+        boxes_lidar[i, 6] = rot_lidar
     
-    # Patch 3: Pre-NMS top N (training)
-    if "pre_nms_top_n_train=2000" in content:
-        content = content.replace(
-            "pre_nms_top_n_train=2000",
-            "pre_nms_top_n_train=1000  # ✓ PATCHED: Fewer proposals"
-        )
-        patches_applied += 1
-        print("✓ Patch 3: Pre-NMS train 2000 → 1000")
+    return boxes_lidar
+
+boxes_lidar = transform_boxes_camera_to_lidar(boxes_camera, calib)
+
+print(f"\n📦 BOXES IN LIDAR COORDINATES (AFTER TRANSFORMATION):")
+if len(boxes_lidar) > 0:
+    print(f"\n   Box format: [x, y, z, h, w, l, rot]")
+    for i, box in enumerate(boxes_lidar):
+        print(f"   Box {i}: x={box[0]:6.2f}, y={box[1]:6.2f}, z={box[2]:6.2f}, "
+              f"h={box[3]:4.2f}, w={box[4]:4.2f}, l={box[5]:4.2f}, rot={box[6]:5.3f}")
     
-    # Patch 4: Pre-NMS top N (test)
-    if "pre_nms_top_n_test=1000" in content:
-        content = content.replace(
-            "pre_nms_top_n_test=1000",
-            "pre_nms_top_n_test=500  # ✓ PATCHED: Fewer proposals"
-        )
-        patches_applied += 1
-        print("✓ Patch 4: Pre-NMS test 1000 → 500")
+    print(f"\n   LiDAR coordinate ranges:")
+    print(f"   X: [{boxes_lidar[:, 0].min():6.2f}, {boxes_lidar[:, 0].max():6.2f}]")
+    print(f"   Y: [{boxes_lidar[:, 1].min():6.2f}, {boxes_lidar[:, 1].max():6.2f}]")
+    print(f"   Z: [{boxes_lidar[:, 2].min():6.2f}, {boxes_lidar[:, 2].max():6.2f}]")
+
+# Check against point cloud range
+print(f"\n🎯 ANCHOR GENERATOR CONFIG:")
+anchor_gen = AnchorGenerator(
+    anchor_sizes=[(1.5, 1.6, 3.9)],
+    anchor_rotations=[0, np.pi/2],
+    feature_map_size=(200, 200),
+    voxel_size=(0.5, 0.5, 0.5),
+    point_cloud_range=(-50, -50, -3, 50, 50, 5)
+)
+
+pc_range = anchor_gen.point_cloud_range
+print(f"   Point cloud range: X=[{pc_range[0]}, {pc_range[3]}], "
+      f"Y=[{pc_range[1]}, {pc_range[4]}], Z=[{pc_range[2]}, {pc_range[5]}]")
+print(f"   Anchor size (h, w, l): (1.5, 1.6, 3.9)")
+
+# Check if boxes are in range
+if len(boxes_lidar) > 0:
+    boxes_tensor = torch.from_numpy(boxes_lidar).float()
     
-    # Patch 5: Post-NMS top N (training)
-    if "post_nms_top_n_train=500" in content:
-        content = content.replace(
-            "post_nms_top_n_train=500",
-            "post_nms_top_n_train=300  # ✓ PATCHED: Stricter filtering"
-        )
-        patches_applied += 1
-        print("✓ Patch 5: Post-NMS train 500 → 300")
+    in_range_x = (boxes_tensor[:, 0] >= pc_range[0]) & (boxes_tensor[:, 0] <= pc_range[3])
+    in_range_y = (boxes_tensor[:, 1] >= pc_range[1]) & (boxes_tensor[:, 1] <= pc_range[4])
+    in_range_z = (boxes_tensor[:, 2] >= pc_range[2]) & (boxes_tensor[:, 2] <= pc_range[5])
+    in_range = in_range_x & in_range_y & in_range_z
     
-    # Patch 6: Post-NMS top N (test)
-    if "post_nms_top_n_test=100" in content:
-        content = content.replace(
-            "post_nms_top_n_test=100",
-            "post_nms_top_n_test=50  # ✓ PATCHED: Stricter filtering"
-        )
-        patches_applied += 1
-        print("✓ Patch 6: Post-NMS test 100 → 50")
+    print(f"\n✅ BOXES IN POINT CLOUD RANGE CHECK:")
+    print(f"   X in range: {in_range_x.sum().item()}/{len(boxes_tensor)}")
+    print(f"   Y in range: {in_range_y.sum().item()}/{len(boxes_tensor)}")
+    print(f"   Z in range: {in_range_z.sum().item()}/{len(boxes_tensor)}")
+    print(f"   ALL in range: {in_range.sum().item()}/{len(boxes_tensor)}")
     
-    # Write patched file
-    if patches_applied > 0:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"\n✅ Applied {patches_applied} patches to {filepath}")
-        return True
+    if in_range.sum() == 0:
+        print(f"\n❌ PROBLEM FOUND: ALL boxes are OUTSIDE point cloud range!")
+        print(f"\n   Boxes are at:")
+        for i, box in enumerate(boxes_lidar):
+            print(f"   Box {i}: ({box[0]:.1f}, {box[1]:.1f}, {box[2]:.1f})")
+        print(f"\n   But point cloud range is:")
+        print(f"   X: [{pc_range[0]}, {pc_range[3]}]")
+        print(f"   Y: [{pc_range[1]}, {pc_range[4]}]")
+        print(f"   Z: [{pc_range[2]}, {pc_range[5]}]")
     else:
-        print(f"\n⚠️  No patches applied (file may already be patched)")
-        return True
+        print(f"\n✅ {in_range.sum().item()} boxes are IN range - Good!")
+        
+        # Check IoU with anchors
+        print(f"\n🔍 CHECKING IoU WITH ANCHORS:")
+        anchors = anchor_gen.generate_anchors(device='cpu')
+        anchors_flat = anchors.view(-1, 7)
+        
+        ious = bev_iou(anchors_flat, boxes_tensor)
+        max_ious, _ = ious.max(dim=1)
+        
+        print(f"   Total anchors: {len(anchors_flat):,}")
+        print(f"   Max IoU: {max_ious.max().item():.4f}")
+        print(f"   Mean IoU: {max_ious.mean().item():.6f}")
+        print(f"   Anchors with IoU > 0: {(max_ious > 0).sum().item():,}")
+        print(f"   Anchors with IoU > 0.3: {(max_ious >= 0.3).sum().item():,}")
+        print(f"   Anchors with IoU > 0.5: {(max_ious >= 0.5).sum().item():,}")
+        
+        if max_ious.max() < 0.3:
+            print(f"\n⚠️  WARNING: Max IoU < 0.3!")
+            print(f"   This means anchors don't match boxes well")
+            print(f"   Possible fixes:")
+            print(f"   1. Adjust anchor sizes to match cars better")
+            print(f"   2. Lower pos_iou_thresh to 0.1 or 0.15")
 
+print(f"\n{'='*80}")
+print("DIAGNOSTIC COMPLETE")
+print("="*80)
 
-def patch_trail(filepath="trail.py"):
-    """
-    Patch trail.py with improved training configuration.
+print(f"\n📊 SUMMARY:")
+if len(boxes_lidar) > 0:
+    boxes_tensor = torch.from_numpy(boxes_lidar).float()
+    in_range_x = (boxes_tensor[:, 0] >= pc_range[0]) & (boxes_tensor[:, 0] <= pc_range[3])
+    in_range_y = (boxes_tensor[:, 1] >= pc_range[1]) & (boxes_tensor[:, 1] <= pc_range[4])
+    in_range_z = (boxes_tensor[:, 2] >= pc_range[2]) & (boxes_tensor[:, 2] <= pc_range[5])
+    in_range = in_range_x & in_range_y & in_range_z
     
-    Changes:
-    - Epochs: 50 → 100
-    - Learning rate: 5e-4 → 1e-4
-    - Samples: 100 → 500
-    """
-    print(f"\n{'='*70}")
-    print(f"PATCHING: {filepath}")
-    print(f"{'='*70}")
-    
-    if not os.path.exists(filepath):
-        print(f"❌ File not found: {filepath}")
-        return False
-    
-    # Backup
-    backup = backup_file(filepath)
-    print(f"✓ Backup created: {backup}")
-    
-    # Read file
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    # Apply patches
-    patches_applied = 0
-    
-    # Patch 1: Increase epochs
-    if "NUM_EPOCHS = 50" in content:
-        content = content.replace(
-            "NUM_EPOCHS = 50",
-            "NUM_EPOCHS = 100  # ✓ PATCHED: Train longer"
-        )
-        patches_applied += 1
-        print("✓ Patch 1: Epochs 50 → 100")
-    
-    # Patch 2: Lower learning rate
-    if "LEARNING_RATE = 5e-4" in content:
-        content = content.replace(
-            "LEARNING_RATE = 5e-4",
-            "LEARNING_RATE = 1e-4  # ✓ PATCHED: More stable learning"
-        )
-        patches_applied += 1
-        print("✓ Patch 2: LR 5e-4 → 1e-4")
-    
-    # Patch 3: More training samples
-    if "NUM_SAMPLES = 100" in content:
-        content = content.replace(
-            "NUM_SAMPLES = 100",
-            "NUM_SAMPLES = 500  # ✓ PATCHED: More data"
-        )
-        patches_applied += 1
-        print("✓ Patch 3: Samples 100 → 500")
-    
-    # Patch 4: Better optimizer (Adam → AdamW)
-    if "optim.Adam(model.parameters()" in content and "optim.AdamW" not in content:
-        content = content.replace(
-            "optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)",
-            "optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)  # ✓ PATCHED: Better optimizer"
-        )
-        patches_applied += 1
-        print("✓ Patch 4: Adam → AdamW with weight decay")
-    
-    # Write patched file
-    if patches_applied > 0:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"\n✅ Applied {patches_applied} patches to {filepath}")
-        return True
+    if in_range.sum() == 0:
+        print("❌ ISSUE: Boxes are outside point cloud range after transformation")
+        print("   → Coordinate transformation might be wrong")
+        print("   → Or point cloud range needs adjustment")
     else:
-        print(f"\n⚠️  No patches applied (file may already be patched)")
-        return True
-
-
-def patch_visualize_predictions(filepath="visualize_predictions.py"):
-    """
-    Patch visualize_predictions.py with stricter visualization parameters.
-    
-    Changes:
-    - NMS threshold: 0.5 → 0.3
-    - Score threshold: 0.1 → 0.3
-    """
-    print(f"\n{'='*70}")
-    print(f"PATCHING: {filepath}")
-    print(f"{'='*70}")
-    
-    if not os.path.exists(filepath):
-        print(f"❌ File not found: {filepath}")
-        return False
-    
-    # Backup
-    backup = backup_file(filepath)
-    print(f"✓ Backup created: {backup}")
-    
-    # Read file
-    with open(filepath, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    # Apply patches
-    patches_applied = 0
-    
-    # Patch 1: NMS threshold in function call
-    if "nms_threshold=0.5" in content:
-        content = content.replace(
-            "nms_threshold=0.5",
-            "nms_threshold=0.3  # ✓ PATCHED: Stricter NMS"
-        )
-        patches_applied += 1
-        print("✓ Patch 1: Visualization NMS 0.5 → 0.3")
-    
-    # Patch 2: Score threshold
-    if "score_threshold=0.1" in content:
-        content = content.replace(
-            "score_threshold=0.1",
-            "score_threshold=0.3  # ✓ PATCHED: Higher confidence"
-        )
-        patches_applied += 1
-        print("✓ Patch 2: Visualization score 0.1 → 0.3")
-    
-    # Write patched file
-    if patches_applied > 0:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"\n✅ Applied {patches_applied} patches to {filepath}")
-        return True
-    else:
-        print(f"\n⚠️  No patches applied (file may already be patched)")
-        return True
-
-
-def main():
-    """Apply all patches."""
-    print("\n" + "="*70)
-    print("QUICK FIX SCRIPT - IMMEDIATE IMPROVEMENTS")
-    print("="*70)
-    print("\nThis script will:")
-    print("  1. ✓ Fix overlapping boxes (stricter NMS)")
-    print("  2. ✓ Improve training configuration")
-    print("  3. ✓ Create backups of all modified files")
-    print("\n" + "="*70)
-    
-    input("\nPress Enter to continue (or Ctrl+C to cancel)...")
-    
-    # Patch files
-    results = {
-        'rpn_refinement.py': patch_rpn_refinement(),
-        'trail.py': patch_trail(),
-        'visualize_predictions.py': patch_visualize_predictions(),
-    }
-    
-    # Summary
-    print("\n" + "="*70)
-    print("PATCH SUMMARY")
-    print("="*70)
-    
-    for filename, success in results.items():
-        status = "✅ SUCCESS" if success else "❌ FAILED"
-        print(f"{status}: {filename}")
-    
-    all_success = all(results.values())
-    
-    if all_success:
-        print("\n" + "="*70)
-        print("✅ ALL PATCHES APPLIED SUCCESSFULLY!")
-        print("="*70)
-        print("\nNext steps:")
-        print("  1. Run trail.py to continue training with better config")
-        print("  2. Training will resume from checkpoint_epoch_4.pth")
-        print("  3. Visualizations will have fewer overlapping boxes")
-        print("\nTo restore original files:")
-        print("  - Look for .backup_* files in the same directory")
-        print("  - Copy them back to original filenames")
-        print("\n" + "="*70)
-    else:
-        print("\n" + "="*70)
-        print("⚠️  SOME PATCHES FAILED")
-        print("="*70)
-        print("\nPlease check:")
-        print("  - File paths are correct")
-        print("  - You have write permissions")
-        print("  - Files exist in current directory")
-    
-    return all_success
-
-
-if __name__ == "__main__":
-    import sys
-    
-    # Check if running from correct directory
-    if not os.path.exists("trail.py") and not os.path.exists("rpn_refinement.py"):
-        print("\n❌ ERROR: Cannot find trail.py or rpn_refinement.py")
-        print("Please run this script from the directory containing your code files.")
-        print(f"Current directory: {os.getcwd()}")
-        sys.exit(1)
-    
-    success = main()
-    sys.exit(0 if success else 1)
+        anchors = anchor_gen.generate_anchors(device='cpu')
+        anchors_flat = anchors.view(-1, 7)
+        ious = bev_iou(anchors_flat, boxes_tensor)
+        max_ious, _ = ious.max(dim=1)
+        
+        if max_ious.max() < 0.1:
+            print("❌ ISSUE: Anchors have near-zero IoU with boxes")
+            print("   → Anchor sizes don't match car sizes")
+            print("   → Need to adjust anchor_sizes in AnchorGenerator")
+        elif max_ious.max() < 0.3:
+            print("⚠️  WARNING: Low max IoU (< 0.3)")
+            print("   → Model will have very few positive anchors")
+            print("   → Lower pos_iou_thresh or adjust anchor sizes")
+        else:
+            print("✅ Boxes are in range and have good IoU with anchors")
+            print(f"   → Max IoU: {max_ious.max().item():.4f}")
+            print(f"   → This should work - check training loop")
+else:
+    print("❌ No boxes found in labels")

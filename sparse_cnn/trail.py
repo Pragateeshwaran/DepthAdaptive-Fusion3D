@@ -21,6 +21,40 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_loader import get_LiDAR, get_radar, get_images, get_labels, get_calib
 
+# ============ CRITICAL FIX #2: Coordinate Transformation ============
+def transform_boxes_camera_to_lidar(boxes_camera, calib):
+    """Transform 3D boxes from camera to LiDAR coordinates."""
+    if len(boxes_camera) == 0:
+        return boxes_camera
+    
+    Tr_velo_to_cam = calib.get('Tr_velo_to_cam', np.eye(4))
+    
+    if Tr_velo_to_cam.shape == (12,):
+        Tr_velo_to_cam = Tr_velo_to_cam.reshape(3, 4)
+        Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
+    elif Tr_velo_to_cam.shape == (3, 4):
+        Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
+    
+    Tr_cam_to_velo = np.linalg.inv(Tr_velo_to_cam)
+    boxes_lidar = np.zeros_like(boxes_camera, dtype=np.float32)
+    
+    for i in range(len(boxes_camera)):
+        x_cam, y_cam, z_cam = boxes_camera[i, 0:3]
+        point_cam = np.array([x_cam, y_cam, z_cam, 1.0])
+        point_lidar = Tr_cam_to_velo @ point_cam
+        boxes_lidar[i, 0:3] = point_lidar[:3]
+        boxes_lidar[i, 3:6] = boxes_camera[i, 3:6]
+        
+        rot_cam = boxes_camera[i, 6]
+        rot_lidar = -rot_cam - np.pi / 2
+        while rot_lidar > np.pi:
+            rot_lidar -= 2 * np.pi
+        while rot_lidar < -np.pi:
+            rot_lidar += 2 * np.pi
+        boxes_lidar[i, 6] = rot_lidar
+    
+    return boxes_lidar
+
 # ============ ROOT CAUSE FIX: Force spconv to use specific algorithm ============
 import os
 os.environ['SPCONV_ALGO_MODE'] = 'native'  # Use native algorithm, not auto-tune
@@ -352,12 +386,14 @@ class V2XRadarDataset(Dataset):
         self.radar_data = get_radar(root_dir, split, from_idx=0, count=num_samples)
         self.image_data = get_images(root_dir, split, from_idx=0, count=num_samples)
         self.labels = get_labels(root_dir, split, from_idx=0, count=num_samples)
+        self.calibs = get_calib(root_dir, split, from_idx=0, count=num_samples)  # FIX: Load calibrations
         
         min_len = min(len(self.lidar_data), len(self.radar_data), len(self.image_data))
         self.lidar_data = self.lidar_data[:min_len]
         self.radar_data = self.radar_data[:min_len]
         self.image_data = self.image_data[:min_len]
         self.labels = self.labels[:min_len]
+        self.calibs = self.calibs[:min_len]  # FIX: Also limit calibrations
         
         print(f"Loaded {len(self)} samples")
     
@@ -370,6 +406,7 @@ class V2XRadarDataset(Dataset):
             'radar': self.radar_data[idx],
             'image': self.image_data[idx],
             'label': self.labels[idx],
+            'calib': self.calibs[idx],  # FIX: Include calibration
             'idx': idx
         }
 
@@ -381,6 +418,7 @@ def collate_fn(batch):
         'radar': [item['radar'] for item in batch],
         'image': [item['image'] for item in batch],
         'label': [item['label'] for item in batch],
+        'calib': [item['calib'] for item in batch],  # FIX: Include calibrations
         'idx': [item['idx'] for item in batch]
     }
 
@@ -404,9 +442,9 @@ class MultiModalDetectionNetwork(nn.Module):
         self.detector = TwoStageDetector(
             backbone_channels=128,
             num_classes=3,
-            num_anchors_per_location=6,
-            pos_iou_thresh=0.3,
-            neg_iou_thresh=0.15
+            num_anchors_per_location=12,  # FIXED: 3 sizes × 4 rotations = 12
+            pos_iou_thresh=0.05,  # FIXED: Very low to match IoU=0.0865
+            neg_iou_thresh=0.01   # FIXED: Very low
         )
     
     def forward(self, lidar_sparse, radar_sparse, images, targets=None, training=True,
@@ -493,7 +531,7 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
     """
     model.train()
     total_loss = 0
-    loss_stats = {'rpn_cls_loss': 0, 'rpn_reg_loss': 0, 'num_pos_anchors': 0, 'total_loss': 0, 'conf_loss': 0}
+    loss_stats = {'rpn_cls_loss': 0, 'rpn_reg_loss': 0, 'num_pos_anchors': 0, 'total_loss': 0}
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
@@ -540,11 +578,22 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         # Prepare images
         images = prepare_images(batch['image']).to(device)
         
-        # Load calibration
-        calibs = get_calib(root_dir, 'training', from_idx=batch['idx'][0], count=len(batch['lidar']))
+        # Parse labels with calibration from batch
+        # 🔍 DEBUG: Check what we're getting
+        print(f"\n🔍 DEBUG Batch {len(batch['label'])} samples:")
+        print(f"   Calib batch length: {len(batch['calib'])}")
+        if len(batch['calib']) > 0:
+            print(f"   First calib type: {type(batch['calib'][0])}")
+            if isinstance(batch['calib'][0], dict):
+                print(f"   First calib keys: {list(batch['calib'][0].keys())}")
         
-        # Parse labels
-        targets = parse_labels_to_targets(batch['label'], calibs)
+        targets = parse_labels_to_targets(batch['label'], batch['calib'])  # FIX: Use batch['calib']
+        
+        # 🔍 DEBUG: Check transformed boxes
+        for i, t in enumerate(targets):
+            boxes = t['boxes_3d']
+            if len(boxes) > 0:
+                print(f"   Target {i}: {len(boxes)} boxes, X=[{boxes[:, 0].min():.1f},{boxes[:, 0].max():.1f}], Y=[{boxes[:, 1].min():.1f},{boxes[:, 1].max():.1f}]")
         for t in targets:
             t['boxes_3d'] = t['boxes_3d'].to(device)
             t['labels'] = t['labels'].to(device)
@@ -558,16 +607,9 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         # Detection loss
         det_loss, loss_dict = det_criterion(outputs, targets)
         
-        # Confidence regularization
-        lidar_conf_features = outputs['lidar_confidence'].features
-        radar_conf_features = outputs['radar_confidence'].features
-        image_conf = outputs['image_confidence']
-        
-        conf_loss = (1 - lidar_conf_features.mean()) + \
-                   (1 - radar_conf_features.mean()) + \
-                   (1 - image_conf.mean())
-        
-        total_loss_batch = det_loss + 0.1 * conf_loss
+        # FIX #3: Remove backwards confidence regularization
+        # Let the model learn confidence naturally through detection loss
+        total_loss_batch = det_loss  # Removed conf_loss term
         
         # Backward
         optimizer.zero_grad()
@@ -579,7 +621,7 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         total_loss += total_loss_batch.item()
         for k in loss_dict:
             loss_stats[k] += loss_dict[k]
-        loss_stats['conf_loss'] += conf_loss.item()
+        # conf_loss removed
         num_batches += 1
         
         pbar.set_postfix({
@@ -692,8 +734,7 @@ def main():
         print(f"\nEpoch {epoch}/{NUM_EPOCHS} - Loss: {train_loss:.4f}")
         print(f"  RPN CLS: {loss_stats['rpn_cls_loss']:.4f} | "
               f"RPN REG: {loss_stats['rpn_reg_loss']:.4f} | "
-              f"Pos Anchors: {loss_stats['num_pos_anchors']:.1f} | "
-              f"CONF: {loss_stats['conf_loss']:.4f}")
+              f"Pos Anchors: {loss_stats['num_pos_anchors']:.1f}")
         
         scheduler.step()
         

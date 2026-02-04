@@ -8,3 +8,4 @@
 /checkpoints
 /sparse
 /models
+/checkpoint_*.pth

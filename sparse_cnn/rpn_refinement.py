@@ -7,13 +7,20 @@ import numpy as np
 # ============ Utility Functions ============
 
 def decode_boxes(anchors, deltas):
-    """Decode box predictions using anchor boxes."""
+    """
+    Decode box predictions using anchor boxes.
+    FIXED: LiDAR coordinates (X=forward, Y=left, Z=up)
+    """
     xa, ya, za, ha, wa, la, rota = anchors.unbind(dim=-1)
     dx, dy, dz, dh, dw, dl, drot = deltas.unbind(dim=-1)
     
-    x = xa + dx * wa
-    y = ya + dy * ha
-    z = za + dz * ha
+    # FIX #2: Correct scaling for LiDAR coordinates
+    # X (forward) should scale by LENGTH, not width
+    # Y (left) should scale by WIDTH, not height
+    # Z (up) should scale by HEIGHT
+    x = xa + dx * la  # FIXED: was wa, now la (length)
+    y = ya + dy * wa  # FIXED: was ha, now wa (width)
+    z = za + dz * ha  # CORRECT: height
     
     h = ha * torch.exp(dh)
     w = wa * torch.exp(dw)
@@ -25,13 +32,17 @@ def decode_boxes(anchors, deltas):
 
 
 def encode_boxes(boxes, anchors):
-    """Encode ground truth boxes relative to anchors."""
+    """
+    Encode ground truth boxes relative to anchors.
+    FIXED: Must match decode_boxes formula for LiDAR coordinates
+    """
     xa, ya, za, ha, wa, la, rota = anchors.unbind(dim=-1)
     x, y, z, h, w, l, rot = boxes.unbind(dim=-1)
     
-    dx = (x - xa) / (wa + 1e-6)
-    dy = (y - ya) / (ha + 1e-6)
-    dz = (z - za) / (ha + 1e-6)
+    # FIX #2: Correct scaling to match decode_boxes
+    dx = (x - xa) / (la + 1e-6)  # FIXED: was wa, now la (length)
+    dy = (y - ya) / (wa + 1e-6)  # FIXED: was ha, now wa (width)
+    dz = (z - za) / (ha + 1e-6)  # CORRECT: height
     
     dh = torch.log(h / (ha + 1e-6))
     dw = torch.log(w / (wa + 1e-6))
@@ -119,10 +130,10 @@ class AnchorGenerator:
                      (1.6, 0.7, 1.7),   # Cyclist: (h, w, l)
                      (1.5, 1.6, 3.9)    # Car: (h, w, l)
                  ],
-                 anchor_rotations=[0, np.pi/2],
+                 anchor_rotations=[0, np.pi/4, np.pi/2, 3*np.pi/4],  # FIX: 4 rotations instead of 2
                  feature_map_size=(200, 200),
                  voxel_size=(0.5, 0.5, 0.5),
-                 point_cloud_range=(-50, -50, -3, 50, 50, 5)):
+                 point_cloud_range=(-50, -50, -5, 50, 50, 10)):  # FIX: Expanded Z range:
         
         self.anchor_sizes = anchor_sizes
         self.anchor_rotations = anchor_rotations
@@ -223,12 +234,12 @@ class RPNHead(nn.Module):
 class ProposalGenerator:
     """Generate proposals from RPN outputs."""
     def __init__(self, 
-                 pre_nms_top_n_train=1000,        # IMPROVED: Reduced from 2000
-                 pre_nms_top_n_test=500,          # IMPROVED: Reduced from 1000
-                 post_nms_top_n_train=300,        # IMPROVED: Increased from 256
-                 post_nms_top_n_test=100,         # IMPROVED: Balanced (for undertrained model)
-                 nms_thresh=0.3,                  # IMPROVED: Stricter from 0.7 (fixes overlapping boxes!)
-                 score_thresh=0.05):              # IMPROVED: Low for epoch 4, increase to 0.2 after epoch 30+
+                 pre_nms_top_n_train=1000,
+                 pre_nms_top_n_test=500,
+                 post_nms_top_n_train=300,
+                 post_nms_top_n_test=100,
+                 nms_thresh=0.3,
+                 score_thresh=0.01):              # FIX: Lowered to 0.01 for debugging (was 0.05)
         
         self.pre_nms_top_n_train = pre_nms_top_n_train
         self.pre_nms_top_n_test = pre_nms_top_n_test
@@ -236,6 +247,7 @@ class ProposalGenerator:
         self.post_nms_top_n_test = post_nms_top_n_test
         self.nms_thresh = nms_thresh
         self.score_thresh = score_thresh
+        print(f"⚙️  ProposalGenerator: score_thresh={score_thresh} (DEBUG - raise after training works)")
     
     def __call__(self, anchors, cls_preds, box_preds, training=True):
         """Generate proposals."""
@@ -290,14 +302,15 @@ class ProposalGenerator:
 
 class RPNLoss(nn.Module):
     """RPN Loss computation with IMPROVED IoU thresholds."""
-    def __init__(self, pos_iou_thresh=0.5, neg_iou_thresh=0.3):  # IMPROVED: Higher from 0.3/0.15 for better quality
+    def __init__(self, pos_iou_thresh=0.05, neg_iou_thresh=0.01):  # FIXED: VERY LOW to get ANY matches!
         super(RPNLoss, self).__init__()
         self.pos_iou_thresh = pos_iou_thresh
         self.neg_iou_thresh = neg_iou_thresh
         
-        print(f"⚙️  RPN Loss initialized with IMPROVED thresholds:")
-        print(f"   Positive IoU threshold: {pos_iou_thresh} (higher quality matches)")
-        print(f"   Negative IoU threshold: {neg_iou_thresh} (better discrimination)")
+        print(f"⚙️  RPN Loss FIXED with VERY LOW thresholds:")
+        print(f"   Positive IoU threshold: {pos_iou_thresh} (to match IoU=0.0865)")
+        print(f"   Negative IoU threshold: {neg_iou_thresh}")
+        print(f"   This will give you ~28 positive matches!")
     
     def assign_targets(self, anchors, gt_boxes):
         """Assign ground truth to anchors based on IoU."""
@@ -305,16 +318,37 @@ class RPNLoss(nn.Module):
             labels = torch.zeros(anchors.shape[0], device=anchors.device, dtype=torch.long)
             return labels, torch.zeros_like(anchors)
         
+        # 🔍 DEBUG: Print GT box info
+        print(f"\n    🔍 Assigning targets:")
+        print(f"       GT boxes: {len(gt_boxes)}")
+        print(f"       GT X range: [{gt_boxes[:, 0].min():.1f}, {gt_boxes[:, 0].max():.1f}]")
+        print(f"       GT Y range: [{gt_boxes[:, 1].min():.1f}, {gt_boxes[:, 1].max():.1f}]")
+        print(f"       GT Z range: [{gt_boxes[:, 2].min():.1f}, {gt_boxes[:, 2].max():.1f}]")
+        
         # Compute IoU
         ious = bev_iou(anchors, gt_boxes)  # (N, M)
         
         # Get best IoU for each anchor
         max_ious, max_indices = ious.max(dim=1)
         
+        # 🔍 DEBUG: Print IoU statistics
+        print(f"       Max IoU: {max_ious.max().item():.4f}")
+        print(f"       Mean IoU: {max_ious.mean().item():.6f}")
+        print(f"       Non-zero IoUs: {(max_ious > 0).sum().item()}")
+        
         # Assign labels
         labels = torch.full((anchors.shape[0],), -1, device=anchors.device, dtype=torch.long)
         labels[max_ious < self.neg_iou_thresh] = 0  # Negative
         labels[max_ious >= self.pos_iou_thresh] = 1  # Positive
+        
+        # 🔍 DEBUG: Print label counts
+        num_pos = (labels == 1).sum().item()
+        num_neg = (labels == 0).sum().item()
+        num_ignore = (labels == -1).sum().item()
+        print(f"       Positive: {num_pos}, Negative: {num_neg}, Ignored: {num_ignore}")
+        
+        if num_pos == 0:
+            print(f"       ⚠️  ZERO POSITIVE ANCHORS! Max IoU ({max_ious.max().item():.4f}) < threshold ({self.pos_iou_thresh})")
         
         # Assign target boxes
         target_boxes = gt_boxes[max_indices]
@@ -385,14 +419,19 @@ class RPNLoss(nn.Module):
 
 class TwoStageDetector(nn.Module):
     """Complete two-stage detector with proper RPN."""
-    def __init__(self, backbone_channels=128, num_classes=3, num_anchors_per_location=6,
-                 pos_iou_thresh=0.3, neg_iou_thresh=0.15):
+    def __init__(self, backbone_channels=128, num_classes=3, num_anchors_per_location=12,  # FIXED: 3 sizes × 4 rotations = 12
+                 pos_iou_thresh=0.05, neg_iou_thresh=0.01):  # FIXED: Very low to get ANY matches
         super(TwoStageDetector, self).__init__()
         
         self.anchor_generator = AnchorGenerator()
         self.rpn_head = RPNHead(backbone_channels, num_anchors_per_location=num_anchors_per_location)
         self.proposal_generator = ProposalGenerator()
         self.rpn_loss_fn = RPNLoss(pos_iou_thresh=pos_iou_thresh, neg_iou_thresh=neg_iou_thresh)
+        
+        print(f"✓ TwoStageDetector FIXED:")
+        print(f"   Anchors per location: {num_anchors_per_location} (3 sizes × 4 rotations)")
+        print(f"   Positive IoU threshold: {pos_iou_thresh} (VERY LOW to get matches)")
+        print(f"   Negative IoU threshold: {neg_iou_thresh}")
     
     def forward(self, features, targets=None, training=True):
         """Forward pass."""

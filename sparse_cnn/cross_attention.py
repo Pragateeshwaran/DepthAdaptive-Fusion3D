@@ -79,11 +79,16 @@ class SparseCrossAttention(nn.Module):
     def forward(self, lidar_feat_sparse, radar_feat_sparse, lidar_conf_sparse, radar_conf_sparse):
         """
         Cross-attention with confidence weighting - MEMORY EFFICIENT VERSION.
+        Per architecture diagram:
+        - LiDAR: Q = FL * (WL-1) where WL-1 = (1 - WL) = (1 - lidar_confidence)
+        - Radar: K, V = FR * WR where WR = radar_confidence
         """
-        # Apply confidence weighting
-        lidar_conf_inv = 1.0 - lidar_conf_sparse.features  # (N, 1)
+        # Apply confidence weighting PER DIAGRAM
+        # LiDAR: weight by (1 - confidence) to reduce where confident
+        lidar_conf_inv = 1.0 - lidar_conf_sparse.features  # (N, 1) - This is WL-1 in diagram
         lidar_weighted = lidar_feat_sparse.features * lidar_conf_inv
         
+        # Radar: weight by confidence directly
         radar_weighted = radar_feat_sparse.features * radar_conf_sparse.features
         
         # Create weighted sparse tensors
@@ -126,10 +131,6 @@ class ATGN(nn.Module):
     
     Extracts point cloud density information and generates a depth threshold
     to divide point clouds for differential fusion at different depths.
-    
-    From paper: "We design an adaptive threshold generation network to divide 
-    point clouds more reasonably and guide the efficient completion of the 
-    fusion process."
     """
     def __init__(self, feature_dim=128, radius=2.0):
         super(ATGN, self).__init__()
@@ -137,8 +138,6 @@ class ATGN(nn.Module):
         self.radius = radius  # Radius for density calculation
         
         # MLP for density feature extraction and threshold generation
-        # Input: volume density (1 channel)
-        # Output: depth threshold (1 channel, normalized to [0, 1])
         self.density_mlp = nn.Sequential(
             nn.Linear(1, 64),
             nn.ReLU(inplace=True),
@@ -160,15 +159,7 @@ class ATGN(nn.Module):
         )
     
     def compute_density(self, points):
-        """
-        Compute volume density for all points.
-        
-        Args:
-            points: (N, 3) point coordinates
-        
-        Returns:
-            density: (N, 1) volume density
-        """
+        """Compute volume density for all points."""
         N = points.shape[0]
         device = points.device
         
@@ -181,7 +172,6 @@ class ATGN(nn.Module):
             batch_points = points[i:end_idx]  # (B, 3)
             
             # Compute distances to all other points
-            # (B, 3) - (1, N, 3) -> (B, N, 3) -> (B, N)
             dists = torch.norm(batch_points.unsqueeze(1) - points.unsqueeze(0), dim=2)
             
             # Count points within radius
@@ -198,42 +188,31 @@ class ATGN(nn.Module):
         return density
     
     def generate_threshold(self, density):
-        """
-        Generate depth threshold from density information.
+        """Generate adaptive depth threshold from density."""
+        # Aggregate density (mean)
+        density_mean = density.mean()
         
-        Args:
-            density: (N, 1) volume density
+        # MLP to generate threshold
+        threshold = self.density_mlp(density_mean.unsqueeze(0).unsqueeze(0))  # (1, 1, 1)
         
-        Returns:
-            threshold: scalar depth threshold (meters)
-        """
-        # Average density across all points
-        avg_density = density.mean()  # Scalar
+        # Scale to reasonable depth range (e.g., 10-50m)
+        threshold = 10.0 + threshold * 40.0  # Range: [10, 50]
         
-        # Pass through MLP to generate normalized threshold
-        threshold_norm = self.density_mlp(avg_density.unsqueeze(0))  # (1, 1)
-        
-        # Scale to reasonable depth range (e.g., 20-50 meters)
-        # Based on KITTI dataset statistics
-        min_depth = 20.0
-        max_depth = 50.0
-        threshold = min_depth + threshold_norm.squeeze() * (max_depth - min_depth)
-        
-        return threshold
+        return threshold.squeeze()
     
     def forward(self, features_sparse, points=None):
         """
-        Apply adaptive gating in SPARSE space.
+        Forward pass with optional density-based threshold generation.
         
         Args:
-            features_sparse: SparseConvTensor with concatenated features (2*feature_dim)
+            features_sparse: SparseConvTensor with concatenated [lidar+image] features
             points: (N, 3) original point coordinates for density calculation
         
         Returns:
-            gated_features: SparseConvTensor
-            depth_threshold: scalar threshold value
+            gated_features: SparseConvTensor with gated features
+            depth_threshold: scalar tensor
         """
-        # Generate depth threshold if points provided
+        # Generate threshold if points provided
         if points is not None:
             density = self.compute_density(points)
             depth_threshold = self.generate_threshold(density)
@@ -252,14 +231,14 @@ class ATGN(nn.Module):
 
 class FusionModule(nn.Module):
     """
-    CORRECTED Fusion Module - MEMORY EFFICIENT VERSION.
+    CORRECTED Fusion Module - Implements architecture diagram exactly.
     
-    Flow:
-    1. Cross-attention (sparse): Q=LiDAR, K=V=Radar
-    2. Residual: Enhanced + Original LiDAR
-    3. Project Image to 3D sparse
+    Flow (per diagram):
+    1. Cross-attention: Q = LiDAR * (1-WL), K/V = Radar * WR
+    2. Residual: Enhanced + Original LiDAR  
+    3. Project Image to 3D sparse weighted by image_conf * (1 - lidar_conf)
     4. Concatenate [Residual, Image]
-    5. ATGN (sparse) - generates threshold and gates features
+    5. ATGN - generates threshold and gates features
     6. Project to BEV
     """
     def __init__(self, 
@@ -301,32 +280,42 @@ class FusionModule(nn.Module):
         bev = dense.sum(dim=2)  # (B, C, H, W)
         return bev
     
-    def image_to_sparse_3d(self, image_feat, lidar_sparse, image_conf):
+    def image_to_sparse_3d(self, image_feat, lidar_sparse, image_conf, lidar_conf_sparse):
         """
-        Project 2D image to 3D sparse space using LiDAR's structure.
+        ⭐ CRITICAL FIX: Project 2D image to 3D sparse space using LiDAR's structure.
+        Per architecture diagram: Weight image by image_conf AND (1 - lidar_conf)
+        
+        Args:
+            image_feat: (B, C, H, W) image features
+            lidar_sparse: SparseConvTensor - provides spatial structure
+            image_conf: (B, 1, H, W) image confidence
+            lidar_conf_sparse: SparseConvTensor - LiDAR confidence at voxels
+        
+        Returns:
+            image_sparse: SparseConvTensor with image features weighted properly
         """
         B, C, H_img, W_img = image_feat.shape
         
-        # Weight image by confidence
+        # Step 1: Weight image by its own confidence
         image_weighted = image_feat * image_conf  # (B, C, H, W)
         
-        # Process image
+        # Step 2: Process image
         image_feat_3d = self.image_to_3d(image_weighted)  # (B, C, H, W)
         
-        # Get LiDAR spatial shape
+        # Step 3: Get LiDAR spatial shape
         spatial_shape = lidar_sparse.spatial_shape  # [D, H, W]
         D, H_lidar, W_lidar = spatial_shape
         
-        # Resize to match LiDAR BEV
+        # Step 4: Resize to match LiDAR BEV
         if (H_img != H_lidar) or (W_img != W_lidar):
             image_feat_3d = F.interpolate(image_feat_3d, size=(H_lidar, W_lidar), 
                                           mode='bilinear', align_corners=False)
         
-        # Expand to 3D by replicating along Z
+        # Step 5: Expand to 3D by replicating along Z
         image_feat_3d = image_feat_3d.unsqueeze(2)  # (B, C, 1, H, W)
         image_feat_3d = image_feat_3d.expand(-1, -1, D, -1, -1)  # (B, C, D, H, W)
         
-        # Sample at LiDAR's sparse locations
+        # Step 6: Sample at LiDAR's sparse locations
         image_feat_3d_flat = image_feat_3d.permute(0, 2, 3, 4, 1).contiguous()  # (B, D, H, W, C)
         
         batch_indices = lidar_sparse.indices[:, 0]
@@ -336,7 +325,12 @@ class FusionModule(nn.Module):
         
         image_features_sparse = image_feat_3d_flat[batch_indices, z_indices, y_indices, x_indices]
         
-        # Create sparse tensor
+        # ⭐ CRITICAL FIX: Weight by (1 - lidar_conf) as per architecture diagram
+        # This implements the multiplication with (1 - WL) for image features
+        lidar_conf_inv = 1.0 - lidar_conf_sparse.features  # (N, 1)
+        image_features_sparse = image_features_sparse * lidar_conf_inv  # (N, C)
+        
+        # Step 7: Create sparse tensor
         image_sparse = lidar_sparse.replace_feature(image_features_sparse)
         
         return image_sparse
@@ -345,12 +339,18 @@ class FusionModule(nn.Module):
                 lidar_conf_sparse, radar_conf_sparse, image_conf,
                 original_points=None):
         """
-        Forward pass - MEMORY EFFICIENT.
+        Forward pass - Implements architecture diagram exactly.
         
         Args:
+            lidar_feat_sparse: SparseConvTensor (N, C)
+            radar_feat_sparse: SparseConvTensor (N, C)
+            image_feat: Tensor (B, C, H, W)
+            lidar_conf_sparse: SparseConvTensor (N, 1) 
+            radar_conf_sparse: SparseConvTensor (N, 1)
+            image_conf: Tensor (B, 1, H, W)
             original_points: (N, 3) original LiDAR points for density calculation
         """
-        # Step 1: Cross-attention (ALL SPARSE - no dense conversion!)
+        # Step 1: Cross-attention (Q=LiDAR*(1-WL), K/V=Radar*WR)
         enhanced_lidar_sparse = self.cross_attention(
             lidar_feat_sparse, 
             radar_feat_sparse,
@@ -358,12 +358,17 @@ class FusionModule(nn.Module):
             radar_conf_sparse
         )
         
-        # Step 2: Residual connection
+        # Step 2: Residual connection (Enhanced + Original)
         residual_features = enhanced_lidar_sparse.features + lidar_feat_sparse.features
         residual_sparse = enhanced_lidar_sparse.replace_feature(residual_features)
         
-        # Step 3: Project Image to 3D sparse
-        image_sparse = self.image_to_sparse_3d(image_feat, lidar_feat_sparse, image_conf)
+        # Step 3: ⭐ FIXED - Project Image to 3D sparse with proper confidence weighting
+        image_sparse = self.image_to_sparse_3d(
+            image_feat, 
+            lidar_feat_sparse, 
+            image_conf, 
+            lidar_conf_sparse  # ⭐ NOW includes lidar confidence
+        )
         
         # Step 4: Concatenate [Residual, Image]
         concatenated_features = torch.cat([
@@ -386,13 +391,15 @@ class FusionModule(nn.Module):
 
 
 if __name__ == "__main__":
-    print("ATGN-Enhanced Sparse Cross-Attention")
-    print("="*60)
-    print("Key features:")
-    print("- Density-based adaptive threshold generation")
-    print("- Memory efficient sparse attention")
-    print("- Paper-based ATGN implementation")
-    print("="*60)
+    print("✅ CORRECTED Cross-Attention with Proper Image Confidence Weighting")
+    print("="*80)
+    print("Key fixes:")
+    print("- ✅ Image features weighted by image_conf * (1 - lidar_conf)")
+    print("- ✅ Implements architecture diagram exactly")
+    print("- ✅ LiDAR: Q = FL * (1-WL)")
+    print("- ✅ Radar: K/V = FR * WR") 
+    print("- ✅ Image: FI * WI * (1-WL)")
+    print("="*80)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -421,10 +428,9 @@ if __name__ == "__main__":
     image_feat = torch.randn(B, C, H, W).to(device)
     image_conf = torch.rand(B, 1, H, W).to(device)
     
-    # Original points for density calculation
-    original_points = torch.randn(num_voxels, 3).to(device) * 10  # Random points
+    original_points = torch.randn(num_voxels, 3).to(device) * 10
     
-    # Test fusion with ATGN
+    # Test fusion
     fusion = FusionModule(feature_dim=C, num_heads=8).to(device)
     fused, threshold = fusion(lidar_sparse, radar_sparse, image_feat,
                              lidar_conf_sparse, radar_conf_sparse, image_conf,
@@ -432,4 +438,4 @@ if __name__ == "__main__":
     
     print(f"\n✓ Fusion output: {fused.shape}")
     print(f"✓ Generated depth threshold: {threshold:.2f}m")
-    print(f"✓ ATGN working correctly!")
+    print(f"✓ All fixes applied successfully!")
