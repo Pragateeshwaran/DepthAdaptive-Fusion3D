@@ -21,7 +21,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_loader import get_LiDAR, get_radar, get_images, get_labels, get_calib
 
-# ============ CRITICAL FIX #2: Coordinate Transformation ============
+# ============ CRITICAL FIX #1: Coordinate Transformation ============
 def transform_boxes_camera_to_lidar(boxes_camera, calib):
     """Transform 3D boxes from camera to LiDAR coordinates."""
     if len(boxes_camera) == 0:
@@ -55,10 +55,10 @@ def transform_boxes_camera_to_lidar(boxes_camera, calib):
     
     return boxes_lidar
 
-# ============ ROOT CAUSE FIX: Force spconv to use specific algorithm ============
+# ============ Force spconv to use specific algorithm ============
 import os
-os.environ['SPCONV_ALGO_MODE'] = 'default'  
-os.environ['SPCONV_DISABLE_CONV_CACHE'] = '0'  # Enable cache
+os.environ['SPCONV_ALGO_MODE'] = 'native'
+os.environ['SPCONV_DISABLE_CONV_CACHE'] = '0'
 
 import torch.backends.cudnn as cudnn
 cudnn.benchmark = False
@@ -109,20 +109,24 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     return start_epoch
 
 
-# ============ PROPER VOXELIZATION - NO DOWNSAMPLING, NO SKIPPING ============
+# ============ PROPER VOXELIZATION - USE ACTUAL LIDAR RANGE ============
 
 def voxelize_lidar_proper(points_batch, 
-                          voxel_size=(0.1, 0.1, 0.1),  # Original resolution
-                          point_cloud_range=(-50, -50, -3, 50, 50, 5)):  # Original range
+                          voxel_size=(0.5, 0.5, 0.5),  # MATCH RPN!
+                          point_cloud_range=(-200, -100, -5, 200, 150, 10)):  # ACTUAL LIDAR RANGE!
     """
-    PROPER voxelization - NO downsampling, NO limits.
-    Uses efficient numpy operations to handle all points.
+    Voxelize LiDAR with ACTUAL LiDAR range.
     """
     spatial_shape = [
         int((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]),
         int((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1]),
         int((point_cloud_range[5] - point_cloud_range[2]) / voxel_size[2])
     ]
+    
+    print(f"🔧 LiDAR voxelization:")
+    print(f"   Range: {point_cloud_range}")
+    print(f"   Voxel size: {voxel_size}")
+    print(f"   Spatial shape: {spatial_shape}")
     
     voxel_features_list = []
     voxel_coords_list = []
@@ -136,7 +140,6 @@ def voxelize_lidar_proper(points_batch,
             points = points.cpu().numpy()
         
         if len(points) == 0:
-            # Must have at least one voxel
             dummy_feat = np.zeros((1, 3), dtype=np.float32)
             dummy_coords = np.array([[batch_idx, spatial_shape[0]//2, spatial_shape[1]//2, spatial_shape[2]//2]], dtype=np.int32)
             voxel_features_list.append(torch.from_numpy(dummy_feat))
@@ -159,7 +162,7 @@ def voxelize_lidar_proper(points_batch,
             voxel_coords_list.append(torch.from_numpy(dummy_coords))
             continue
         
-        # Hash-based grouping - EFFICIENT for any number of points
+        # Hash-based grouping
         voxel_hash = (voxel_coords[:, 0].astype(np.int64) * spatial_shape[1] * spatial_shape[2] + 
                      voxel_coords[:, 1].astype(np.int64) * spatial_shape[2] + 
                      voxel_coords[:, 2].astype(np.int64))
@@ -168,14 +171,13 @@ def voxelize_lidar_proper(points_batch,
         unique_hash, inverse = np.unique(voxel_hash, return_inverse=True)
         num_voxels = len(unique_hash)
         
-        # Aggregate features efficiently using bincount
+        # Aggregate features
         voxel_features = np.zeros((num_voxels, 3), dtype=np.float32)
         
         for i in range(3):  # XYZ
             voxel_features[:, i] = np.bincount(inverse, weights=points_valid[:, i], 
                                                minlength=num_voxels)
         
-        # Average by count (cast to float32 — bincount returns float64)
         voxel_counts = np.bincount(inverse, minlength=num_voxels).astype(np.float32)
         voxel_features = voxel_features / (voxel_counts[:, np.newaxis] + np.float32(1e-8))
         
@@ -195,18 +197,25 @@ def voxelize_lidar_proper(points_batch,
     voxel_features = torch.cat(voxel_features_list, dim=0)
     voxel_coords = torch.cat(voxel_coords_list, dim=0)
     
+    print(f"   Generated {len(voxel_features):,} voxels")
+    
     return voxel_features, voxel_coords, spatial_shape, len(points_batch)
 
 
 def voxelize_radar_proper(points_batch, 
-                          voxel_size=(0.2, 0.2, 0.2),  # Original resolution
-                          point_cloud_range=(-50, -50, -3, 50, 50, 5)):
-    """PROPER radar voxelization - NO downsampling, NO limits."""
+                          voxel_size=(0.5, 0.5, 0.5),  # MATCH LIDAR!
+                          point_cloud_range=(-200, -100, -5, 200, 150, 10)):  # ACTUAL LIDAR RANGE!
+    """Voxelize Radar with same parameters as LiDAR."""
     spatial_shape = [
         int((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]),
         int((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1]),
         int((point_cloud_range[5] - point_cloud_range[2]) / voxel_size[2])
     ]
+    
+    print(f"🔧 Radar voxelization:")
+    print(f"   Range: {point_cloud_range}")
+    print(f"   Voxel size: {voxel_size}")
+    print(f"   Spatial shape: {spatial_shape}")
     
     voxel_features_list = []
     voxel_coords_list = []
@@ -277,11 +286,12 @@ def voxelize_radar_proper(points_batch,
     voxel_features = torch.cat(voxel_features_list, dim=0)
     voxel_coords = torch.cat(voxel_coords_list, dim=0)
     
+    print(f"   Generated {len(voxel_features):,} voxels")
+    
     return voxel_features, voxel_coords, spatial_shape, len(points_batch)
 
 
-# ============ Function Aliases for Backward Compatibility ============
-# These aliases allow visualize_predictions.py to import the functions
+# ============ Function Aliases ============
 voxelize_lidar = voxelize_lidar_proper
 voxelize_radar = voxelize_radar_proper
 
@@ -299,34 +309,6 @@ def prepare_images(image_batch):
         images_tensor.append(img_tensor)
     
     return torch.stack(images_tensor)
-
-
-def transform_boxes_camera_to_lidar(boxes_camera, calib):
-    """Transform boxes from camera coordinates to LiDAR coordinates."""
-    if len(boxes_camera) == 0:
-        return boxes_camera
-    
-    Tr_velo_to_cam = calib.get('Tr_velo_to_cam', np.eye(4))
-    
-    if Tr_velo_to_cam.shape == (12,):
-        Tr_velo_to_cam = Tr_velo_to_cam.reshape(3, 4)
-        Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
-    
-    Tr_cam_to_velo = np.linalg.inv(Tr_velo_to_cam)
-    
-    boxes_lidar = boxes_camera.copy()
-    
-    for i in range(len(boxes_camera)):
-        x_cam, y_cam, z_cam = boxes_camera[i, 0:3]
-        point_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-        point_lidar = Tr_cam_to_velo @ point_cam
-        boxes_lidar[i, 0:3] = point_lidar[:3]
-        
-        rot_cam = boxes_camera[i, 6]
-        rot_lidar = -rot_cam - np.pi / 2
-        boxes_lidar[i, 6] = rot_lidar
-    
-    return boxes_lidar
 
 
 def parse_labels_to_targets(labels_batch, calib_batch=None):
@@ -358,6 +340,11 @@ def parse_labels_to_targets(labels_batch, calib_batch=None):
             else:
                 boxes_lidar = boxes_camera
             
+            print(f"📊 GT boxes in LiDAR coordinates:")
+            print(f"   X range: [{boxes_lidar[:, 0].min():.1f}, {boxes_lidar[:, 0].max():.1f}]")
+            print(f"   Y range: [{boxes_lidar[:, 1].min():.1f}, {boxes_lidar[:, 1].max():.1f}]")
+            print(f"   Z range: [{boxes_lidar[:, 2].min():.1f}, {boxes_lidar[:, 2].max():.1f}]")
+            
             targets.append({
                 'boxes_3d': torch.tensor(boxes_lidar, dtype=torch.float32),
                 'labels': torch.tensor(labels_list, dtype=torch.long),
@@ -386,14 +373,14 @@ class V2XRadarDataset(Dataset):
         self.radar_data = get_radar(root_dir, split, from_idx=0, count=num_samples)
         self.image_data = get_images(root_dir, split, from_idx=0, count=num_samples)
         self.labels = get_labels(root_dir, split, from_idx=0, count=num_samples)
-        self.calibs = get_calib(root_dir, split, from_idx=0, count=num_samples)  # FIX: Load calibrations
+        self.calibs = get_calib(root_dir, split, from_idx=0, count=num_samples)
         
         min_len = min(len(self.lidar_data), len(self.radar_data), len(self.image_data))
         self.lidar_data = self.lidar_data[:min_len]
         self.radar_data = self.radar_data[:min_len]
         self.image_data = self.image_data[:min_len]
         self.labels = self.labels[:min_len]
-        self.calibs = self.calibs[:min_len]  # FIX: Also limit calibrations
+        self.calibs = self.calibs[:min_len]
         
         print(f"Loaded {len(self)} samples")
     
@@ -406,7 +393,7 @@ class V2XRadarDataset(Dataset):
             'radar': self.radar_data[idx],
             'image': self.image_data[idx],
             'label': self.labels[idx],
-            'calib': self.calibs[idx],  # FIX: Include calibration
+            'calib': self.calibs[idx],
             'idx': idx
         }
 
@@ -418,7 +405,7 @@ def collate_fn(batch):
         'radar': [item['radar'] for item in batch],
         'image': [item['image'] for item in batch],
         'label': [item['label'] for item in batch],
-        'calib': [item['calib'] for item in batch],  # FIX: Include calibrations
+        'calib': [item['calib'] for item in batch],
         'idx': [item['idx'] for item in batch]
     }
 
@@ -439,22 +426,26 @@ class MultiModalDetectionNetwork(nn.Module):
             dropout=0.1
         )
         
+        # 🔥 CRITICAL: Force positives and lower thresholds
         self.detector = TwoStageDetector(
             backbone_channels=128,
             num_classes=3,
-            num_anchors_per_location=12,  # FIXED: 3 sizes × 4 rotations = 12
-            pos_iou_thresh=0.05,  # FIXED: Very low to match IoU=0.0865
-            neg_iou_thresh=0.01   # FIXED: Very low
+            num_anchors_per_location=2,
+            pos_iou_thresh=0.1,  # VERY LOW to get matches
+            neg_iou_thresh=0.05,  # VERY LOW
+            force_positives=True  # FORCE positive matches
         )
+        
+        print(f"✅ MultiModalDetectionNetwork with FORCED positives")
     
     def forward(self, lidar_sparse, radar_sparse, images, targets=None, training=True,
                 original_lidar_points=None):
-        """Forward pass with original LiDAR points for density calculation."""
+        """Forward pass."""
         if original_lidar_points is not None:
             points_for_density = original_lidar_points
         else:
             lidar_indices = lidar_sparse.indices.float()
-            points_for_density = lidar_indices[:, 1:]
+            points_for_density = lidar_indices[:, 1:] * 0.5  # Convert to meters
         
         lidar_feat_sparse, lidar_conf_sparse = self.lidar_net(lidar_sparse)
         radar_feat_sparse, radar_conf_sparse = self.radar_net(radar_sparse)
@@ -469,6 +460,20 @@ class MultiModalDetectionNetwork(nn.Module):
             image_conf,
             original_points=points_for_density
         )
+        
+        # CRITICAL FIX: Upsample tiny BEV to usable size
+        B, C, H_bev, W_bev = fused_features.shape
+        if H_bev < 100 or W_bev < 60:
+            import torch.nn.functional as F
+            target_h = max(100, H_bev)
+            target_w = max(60, W_bev)
+            print(f'🔧 Upsampling BEV from {H_bev}×{W_bev} to {target_h}×{target_w}')
+            fused_features = F.interpolate(
+                fused_features,
+                size=(target_h, target_w),
+                mode='bilinear',
+                align_corners=False
+            )
         
         detection_outputs = self.detector(fused_features, targets=targets, training=training)
         
@@ -522,13 +527,10 @@ class DetectionLoss(nn.Module):
             }
 
 
-# ============ NO-SKIP Training Loop ============
+# ============ Training Loop ============
 
 def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, root_dir):
-    """
-    NO-SKIP training loop - processes EVERY batch without exceptions.
-    NO downsampling, NO artificial limits.
-    """
+    """Training loop."""
     model.train()
     total_loss = 0
     loss_stats = {'rpn_cls_loss': 0, 'rpn_reg_loss': 0, 'num_pos_anchors': 0, 'total_loss': 0}
@@ -537,16 +539,15 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(pbar):
-        # Get original points - NO downsampling
+        # Get original points
         original_points_list = [torch.from_numpy(lidar).float()[:, :3] for lidar in batch['lidar']]
         
-        # PROPER voxelization - processes ALL points
+        # Voxelize with ACTUAL LiDAR range
         lidar_result = voxelize_lidar_proper(batch['lidar'])
         radar_result = voxelize_radar_proper(batch['radar'])
         
-        # Should never be None
         if lidar_result is None or radar_result is None:
-            print(f"\n❌ FATAL: Voxelization returned None for batch {batch_idx}")
+            print(f"\n❌ Voxelization failed for batch {batch_idx}")
             continue
         
         lidar_feat, lidar_coords, lidar_shape, lidar_bs = lidar_result
@@ -578,28 +579,15 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         # Prepare images
         images = prepare_images(batch['image']).to(device)
         
-        # Parse labels with calibration from batch
-        # 🔍 DEBUG: Check what we're getting
-        print(f"\n🔍 DEBUG Batch {len(batch['label'])} samples:")
-        print(f"   Calib batch length: {len(batch['calib'])}")
-        if len(batch['calib']) > 0:
-            print(f"   First calib type: {type(batch['calib'][0])}")
-            if isinstance(batch['calib'][0], dict):
-                print(f"   First calib keys: {list(batch['calib'][0].keys())}")
+        # Parse labels with calibration
+        targets = parse_labels_to_targets(batch['label'], batch['calib'])
         
-        targets = parse_labels_to_targets(batch['label'], batch['calib'])  # FIX: Use batch['calib']
-        
-        # 🔍 DEBUG: Check transformed boxes
-        for i, t in enumerate(targets):
-            boxes = t['boxes_3d']
-            if len(boxes) > 0:
-                print(f"   Target {i}: {len(boxes)} boxes, X=[{boxes[:, 0].min():.1f},{boxes[:, 0].max():.1f}], Y=[{boxes[:, 1].min():.1f},{boxes[:, 1].max():.1f}]")
         for t in targets:
             t['boxes_3d'] = t['boxes_3d'].to(device)
             t['labels'] = t['labels'].to(device)
             t['scores'] = t['scores'].to(device)
         
-        # Forward pass - this is where spconv error happens
+        # Forward pass
         outputs = model(lidar_sparse, radar_sparse, images, 
                        targets=targets, training=True,
                        original_lidar_points=original_points_concat)
@@ -607,9 +595,7 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         # Detection loss
         det_loss, loss_dict = det_criterion(outputs, targets)
         
-        # FIX #3: Remove backwards confidence regularization
-        # Let the model learn confidence naturally through detection loss
-        total_loss_batch = det_loss  # Removed conf_loss term
+        total_loss_batch = det_loss
         
         # Backward
         optimizer.zero_grad()
@@ -621,7 +607,6 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         total_loss += total_loss_batch.item()
         for k in loss_dict:
             loss_stats[k] += loss_dict[k]
-        # conf_loss removed
         num_batches += 1
         
         pbar.set_postfix({
@@ -641,29 +626,26 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
 
 
 def main():
-    # IMPROVED Configuration for Better Accuracy
+    # Configuration for OVERFITTING
     ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
-    BATCH_SIZE = 2              # OPTIMIZED for RTX 3060 12GB (was 4 - too large!)
-    NUM_EPOCHS = 100            # IMPROVED: Increased from 50 (model needs more training!)
-    LEARNING_RATE = 1e-4        # IMPROVED: Reduced from 5e-4 (more stable convergence)
-    NUM_SAMPLES = 500           # IMPROVED: Increased from 100 (more training data!)
-    WEIGHT_DECAY = 1e-4         # NEW: L2 regularization to prevent overfitting
+    BATCH_SIZE = 1        # OVERFIT: Single sample
+    NUM_EPOCHS = 100      # Overfit thoroughly
+    LEARNING_RATE = 1e-4
+    NUM_SAMPLES = 1       # OVERFIT: Only one sample
+    WEIGHT_DECAY = 1e-4
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA Version: {torch.version.cuda}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
     print(f"\n{'='*70}")
-    print("IMPROVED TRAINING CONFIGURATION")
+    print("OVERFITTING CONFIGURATION")
     print(f"{'='*70}")
-    print(f"Epochs: {NUM_EPOCHS} (was 50)")
-    print(f"Samples: {NUM_SAMPLES} (was 100)")
-    print(f"Learning Rate: {LEARNING_RATE} (was 5e-4)")
-    print(f"Batch Size: {BATCH_SIZE} (optimized for {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
-    print(f"Weight Decay: {WEIGHT_DECAY} (new)")
+    print(f"Training on ONE sample only")
+    print(f"LiDAR range: [-200, 200] × [-100, 150]")
+    print(f"Force positives: ENABLED")
     print(f"{'='*70}\n")
     
     NUM_WORKERS = 0
@@ -678,19 +660,8 @@ def main():
     
     # Loss & Optimizer
     det_criterion = DetectionLoss()
-    
-    # IMPROVED: AdamW with weight decay (better than Adam)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    
-    # IMPROVED: Better learning rate schedule
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=NUM_EPOCHS, 
-        eta_min=0.5  # Minimum learning rate
-    )
-    
-    print("✓ Using AdamW optimizer with weight decay")
-    print("✓ Using Cosine Annealing LR scheduler")
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=0.5)
     
     # Checkpoint loading
     start_epoch = 1
@@ -699,7 +670,6 @@ def main():
     if checkpoint_info is not None:
         checkpoint_path, checkpoint_epoch = checkpoint_info
         print(f"\n✓ Found checkpoint: {checkpoint_path}")
-        
         start_epoch = load_checkpoint(model, optimizer, checkpoint_path, device)
         for _ in range(checkpoint_epoch):
             scheduler.step()
@@ -707,27 +677,15 @@ def main():
         print("\nNo checkpoint found. Starting fresh training...")
     
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("\n🎯 ROOT CAUSE FIX APPLIED:")
-    print("  ✓ spconv algorithm mode: NATIVE (no auto-tune)")
-    print("  ✓ NO downsampling - all points processed")
-    print("  ✓ NO skipping - every batch processed")
-    print("  ✓ NO artificial voxel limits")
-    print("  ✓ Original resolution maintained (0.1m LiDAR, 0.2m Radar)")
-    print("  ✓ Full range maintained (100m x 100m)")
-    print("\nThis forces spconv to use a stable algorithm that works for all voxel counts.\n")
     
     # Training
     train_losses = []
     
-    print(f"Starting training from epoch {start_epoch}...\n")
+    print(f"Starting OVERFITTING from epoch {start_epoch}...\n")
     
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         train_loss, loss_stats = train_one_epoch(model, train_loader, optimizer, 
                                                   det_criterion, device, epoch, ROOT_DIR)
-        
-        # if train_loss == 0:
-        #     print(f"⚠️  Epoch {epoch}: No valid batches processed!")
-        #     continue
         
         train_losses.append(train_loss)
 
@@ -739,7 +697,7 @@ def main():
         scheduler.step()
         
         # Save checkpoint
-        if epoch % 20 == 0 or epoch==100:
+        if epoch % 10 == 0:
             print(f"\n{'='*70}")
             print(f"💾 Saving checkpoint at epoch {epoch}...")
             torch.save({
@@ -762,8 +720,8 @@ def main():
         'scheduler_state_dict': scheduler.state_dict(),
         'loss': train_losses[-1] if train_losses else 0,
         'train_losses': train_losses
-    }, 'final_model.pth')
-    print("\n✓ Saved final model to final_model.pth")
+    }, 'overfitted_model.pth')
+    print("\n✓ Saved overfitted model to overfitted_model.pth")
     
     # Plot
     if len(train_losses) > 0:
@@ -772,13 +730,13 @@ def main():
         plt.plot(epochs_range, train_losses, label='Total Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-        plt.title(f'Training Loss (Resumed from Epoch {start_epoch})')
+        plt.title(f'Overfitting Loss (Resumed from Epoch {start_epoch})')
         plt.legend()
         plt.grid(True)
-        plt.savefig('training_curve.png')
-        print("✓ Saved training curve to training_curve.png")
+        plt.savefig('overfitting_curve.png')
+        print("✓ Saved training curve to overfitting_curve.png")
     
-    print("\n✓ Training complete!")
+    print("\n✓ Overfitting complete!")
 
 
 if __name__ == "__main__":

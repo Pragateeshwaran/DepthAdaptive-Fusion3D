@@ -1,6 +1,5 @@
 """
-COMPLETE VISUALIZATION WITH DIAGNOSTICS
-Shows GREEN GT boxes and RED predicted boxes with coordinate checking
+VISUALIZATION WITH FIXED COORDINATE SYSTEM
 """
 import numpy as np
 import open3d as o3d
@@ -11,7 +10,15 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
-CHECKPOINT_PATH = r'F:\Work\DeepLearning\Research\checkpoint_epoch_40.pth'
+CHECKPOINT_PATH = r'F:\Work\DeepLearning\Research\checkpoint_epoch_40.pth'  # Use the overfitted model
+
+# Must match training defaults in sparse_cnn/trail.py
+LIDAR_VOXEL_SIZE = (0.1, 0.1, 0.1)
+RADAR_VOXEL_SIZE = (0.2, 0.2, 0.2)
+POINT_CLOUD_RANGE = (-50, -50, -3, 50, 50, 5)
+
+# Visualization-only: avoid dropping all boxes when scores are very low
+FORCE_SHOW_PREDICTIONS = True
 
 
 def transform_boxes_camera_to_lidar(boxes_camera, calib):
@@ -103,7 +110,7 @@ def create_bbox_lineset(boxes, color=[1, 0, 0], line_width=2.0):
 
 
 def to_tensor(data, dtype=torch.float32, device='cuda'):
-    """Convert data to tensor, handling both numpy and tensor inputs."""
+    """Convert data to tensor."""
     if isinstance(data, torch.Tensor):
         return data.to(dtype).to(device)
     else:
@@ -164,7 +171,8 @@ def load_model_and_predict(sample_idx, checkpoint_path):
     
     print(f"✅ Data loaded:")
     print(f"   LiDAR points: {len(lidar_points):,}")
-    print(f"   Radar points: {len(radar_points):,}")
+    print(f"   LiDAR X range: [{lidar_points[:, 0].min():.1f}, {lidar_points[:, 0].max():.1f}]")
+    print(f"   LiDAR Y range: [{lidar_points[:, 1].min():.1f}, {lidar_points[:, 1].max():.1f}]")
     
     # Parse GT boxes
     gt_boxes_camera = []
@@ -182,26 +190,25 @@ def load_model_and_predict(sample_idx, checkpoint_path):
     print(f"✅ Ground truth: {len(gt_boxes_lidar)} boxes")
     print(f"   GT X range: [{gt_boxes_lidar[:, 0].min():.1f}, {gt_boxes_lidar[:, 0].max():.1f}]")
     print(f"   GT Y range: [{gt_boxes_lidar[:, 1].min():.1f}, {gt_boxes_lidar[:, 1].max():.1f}]")
-    print(f"   GT Z range: [{gt_boxes_lidar[:, 2].min():.1f}, {gt_boxes_lidar[:, 2].max():.1f}]")
     
-    # Prepare input
-    print(f"\n🔄 Preparing model input...")
+    # Prepare input with SAME parameters as training
+    print(f"\n🔄 Preparing model input with training parameters...")
     
-    # Voxelize
+    # Voxelize with SAME parameters as training
     lidar_feat, lidar_coords, lidar_shape, lidar_bs = voxelize_lidar_proper(
-        [lidar_points], 
-        voxel_size=(0.1, 0.1, 0.1),
-        point_cloud_range=(-50, -50, -3, 50, 50, 5)
+        [lidar_points],
+        voxel_size=LIDAR_VOXEL_SIZE,
+        point_cloud_range=POINT_CLOUD_RANGE
     )
     
     radar_feat, radar_coords, radar_shape, radar_bs = voxelize_radar_proper(
         [radar_points],
-        voxel_size=(0.2, 0.2, 0.2),
-        point_cloud_range=(-50, -50, -3, 50, 50, 5)
+        voxel_size=RADAR_VOXEL_SIZE,
+        point_cloud_range=POINT_CLOUD_RANGE
     )
     
-    print(f"   LiDAR voxels: {len(lidar_feat) if hasattr(lidar_feat, '__len__') else lidar_feat.shape[0]:,}")
-    print(f"   Radar voxels: {len(radar_feat) if hasattr(radar_feat, '__len__') else radar_feat.shape[0]:,}")
+    print(f"   LiDAR voxels: {len(lidar_feat):,}")
+    print(f"   Radar voxels: {len(radar_feat):,}")
     
     # Create sparse tensors
     lidar_sparse = spconv.SparseConvTensor(
@@ -225,54 +232,45 @@ def load_model_and_predict(sample_idx, checkpoint_path):
     # Run inference
     print(f"\n🚀 Running inference...")
     try:
+        if FORCE_SHOW_PREDICTIONS and hasattr(model, 'detector'):
+            model.detector.proposal_generator.score_thresh = 0.0
+            print("FORCE_SHOW_PREDICTIONS=True: score_thresh set to 0.0 for visualization")
         with torch.no_grad():
             outputs = model(lidar_sparse, radar_sparse, image_tensor, training=False)
-            
+            print("00000000000000000000000000000000000000000000000000000000000000000000000000000")
+            print(outputs)
             proposals = outputs['detections']['proposals'][0]
             scores = outputs['detections']['scores'][0]
         
         if len(proposals) > 0:
             pred_boxes = proposals.cpu().numpy()
             pred_scores = scores.cpu().numpy()
+            print(f"   Score range: [{pred_scores.min():.6f}, {pred_scores.max():.6f}]")
             
             print(f"\n✅ Predictions: {len(pred_boxes)} boxes")
-            print(f"   Score range: [{pred_scores.min():.3f}, {pred_scores.max():.3f}]")
             print(f"   Pred X range: [{pred_boxes[:, 0].min():.1f}, {pred_boxes[:, 0].max():.1f}]")
             print(f"   Pred Y range: [{pred_boxes[:, 1].min():.1f}, {pred_boxes[:, 1].max():.1f}]")
-            print(f"   Pred Z range: [{pred_boxes[:, 2].min():.1f}, {pred_boxes[:, 2].max():.1f}]")
             
-            # 🔍 DIAGNOSTIC: Compare coordinates
+            # 🔍 COORDINATE DIAGNOSTIC
             print(f"\n{'='*80}")
             print(f"🔍 COORDINATE DIAGNOSTIC")
             print(f"{'='*80}")
             
-            gt_center = gt_boxes_lidar[:, :3].mean(axis=0)
-            pred_center = pred_boxes[:, :3].mean(axis=0)
-            distance = np.linalg.norm(gt_center - pred_center)
-            
-            print(f"Ground Truth Center: X={gt_center[0]:.1f}, Y={gt_center[1]:.1f}, Z={gt_center[2]:.1f}")
-            print(f"Prediction Center:   X={pred_center[0]:.1f}, Y={pred_center[1]:.1f}, Z={pred_center[2]:.1f}")
-            print(f"Distance between centers: {distance:.1f}m")
-            
-            if distance > 50:
-                print(f"\n⚠️  CRITICAL: Predictions are {distance:.0f}m away from GT!")
-                print(f"   This indicates a COORDINATE SYSTEM MISMATCH")
-                print(f"\nPossible causes:")
-                print(f"   1. Predictions in feature map space instead of world space")
-                print(f"   2. Missing coordinate transformation in decode_boxes")
-                print(f"   3. Wrong anchor generation")
-            elif distance > 20:
-                print(f"\n⚠️  WARNING: Predictions are {distance:.0f}m away from GT")
-                print(f"   Model hasn't learned well yet, or coordinate issue")
-            else:
-                print(f"\n✅ GOOD: Predictions are close to GT ({distance:.1f}m)")
-                print(f"   Coordinate system looks correct!")
-            
-            # Check if in feature space (0-50 range typical for 50x50 feature map)
-            if pred_boxes[:, 0].min() >= 0 and pred_boxes[:, 0].max() <= 60:
-                print(f"\n⚠️  Predictions look like FEATURE MAP coordinates!")
-                print(f"   Feature map is typically 0-50, predictions are [{pred_boxes[:, 0].min():.1f}, {pred_boxes[:, 0].max():.1f}]")
-                print(f"   They should be in world space: [-50, 50]")
+            if len(gt_boxes_lidar) > 0:
+                gt_center = gt_boxes_lidar[:, :3].mean(axis=0)
+                pred_center = pred_boxes[:, :3].mean(axis=0)
+                distance = np.linalg.norm(gt_center - pred_center)
+                
+                print(f"Ground Truth Center: X={gt_center[0]:.1f}, Y={gt_center[1]:.1f}")
+                print(f"Prediction Center:   X={pred_center[0]:.1f}, Y={pred_center[1]:.1f}")
+                print(f"Distance between centers: {distance:.1f}m")
+                
+                if distance > 50:
+                    print(f"\n⚠️  CRITICAL: Predictions are {distance:.0f}m away from GT!")
+                    print(f"   Coordinate system still mismatched!")
+                elif distance < 10:
+                    print(f"\n✅ GOOD: Predictions are close to GT ({distance:.1f}m)")
+                    print(f"   Coordinate system is CORRECT!")
             
             print(f"{'='*80}\n")
             
@@ -297,34 +295,16 @@ def visualize(lidar_points, gt_boxes, pred_boxes, sample_idx=0):
     print(f"🎨 CREATING VISUALIZATION")
     print(f"{'='*80}")
     
-    # Debug info
-    print(f"📊 Data to visualize:")
-    print(f"   LiDAR points: {len(lidar_points):,}")
-    print(f"   LiDAR X range: [{lidar_points[:, 0].min():.1f}, {lidar_points[:, 0].max():.1f}]")
-    print(f"   LiDAR Y range: [{lidar_points[:, 1].min():.1f}, {lidar_points[:, 1].max():.1f}]")
-    print(f"   LiDAR Z range: [{lidar_points[:, 2].min():.1f}, {lidar_points[:, 2].max():.1f}]")
+    # Filter LiDAR points to reasonable range
+    mask_x = (lidar_points[:, 0] >= POINT_CLOUD_RANGE[0]) & (lidar_points[:, 0] <= POINT_CLOUD_RANGE[3])
+    mask_y = (lidar_points[:, 1] >= POINT_CLOUD_RANGE[1]) & (lidar_points[:, 1] <= POINT_CLOUD_RANGE[4])
+    mask = mask_x & mask_y
+    lidar_points_filtered = lidar_points[mask]
+    
+    print(f"📊 Visualization data:")
+    print(f"   LiDAR points: {len(lidar_points_filtered):,} (filtered to POINT_CLOUD_RANGE)")
     print(f"   GT boxes: {len(gt_boxes)}")
     print(f"   Pred boxes: {len(pred_boxes)}")
-    
-    # Filter points near boxes
-    if len(gt_boxes) > 0 or len(pred_boxes) > 0:
-        all_boxes = np.vstack([gt_boxes, pred_boxes]) if len(pred_boxes) > 0 else gt_boxes
-        
-        box_center = np.array([
-            all_boxes[:, 0].mean(),
-            all_boxes[:, 1].mean(),
-            all_boxes[:, 2].mean()
-        ])
-        
-        # Filter points within 100m
-        dists = np.linalg.norm(lidar_points[:, :3] - box_center, axis=1)
-        mask = dists < 100
-        lidar_points_filtered = lidar_points[mask]
-        
-        print(f"   Filtered to {len(lidar_points_filtered):,} points within 100m of boxes")
-    else:
-        lidar_points_filtered = lidar_points
-        box_center = np.array([0, 0, 0])
     
     # Point cloud
     pcd = o3d.geometry.PointCloud()
@@ -332,40 +312,33 @@ def visualize(lidar_points, gt_boxes, pred_boxes, sample_idx=0):
     
     # Color by height
     z_values = lidar_points_filtered[:, 2]
-    z_norm = (z_values - z_values.min()) / (z_values.max() - z_values.min() + 1e-6)
+    z_min, z_max = z_values.min(), z_values.max()
+    if z_max - z_min > 0:
+        z_norm = (z_values - z_min) / (z_max - z_min)
+    else:
+        z_norm = np.zeros_like(z_values)
     colors = np.stack([z_norm * 0.7, z_norm * 0.7, z_norm * 0.7], axis=1)
     pcd.colors = o3d.utility.Vector3dVector(colors)
     
-    # Boxes - make lines thicker by creating multiple slightly offset copies
+    # Boxes
     gt_lineset = create_bbox_lineset(gt_boxes, color=[0, 1, 0])      # GREEN
     pred_lineset = create_bbox_lineset(pred_boxes, color=[1, 0, 0])  # RED
     
     # Coordinate frame
+    if len(gt_boxes) > 0:
+        center = gt_boxes[:, :3].mean(axis=0)
+    else:
+        center = np.array([0, 0, 0])
+    
     coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=10.0, origin=box_center
+        size=10.0, origin=center
     )
     
     geometries = [pcd, coord_frame]
     if len(gt_boxes) > 0:
         geometries.append(gt_lineset)
-        print(f"   ✅ Added {len(gt_boxes)} GREEN GT boxes")
     if len(pred_boxes) > 0:
         geometries.append(pred_lineset)
-        print(f"   ✅ Added {len(pred_boxes)} RED predicted boxes")
-    
-    print(f"\n{'='*80}")
-    print(f"VISUALIZATION CONTROLS:")
-    print(f"  - LEFT CLICK + DRAG: Rotate view")
-    print(f"  - SCROLL: Zoom in/out")
-    print(f"  - RIGHT CLICK + DRAG: Pan camera")
-    print(f"  - Press 'Q': Close window")
-    print(f"{'='*80}")
-    print(f"LEGEND:")
-    print(f"  🟢 GREEN boxes = Ground Truth ({len(gt_boxes)} boxes)")
-    print(f"  🔴 RED boxes = Model Predictions ({len(pred_boxes)} boxes)")
-    print(f"  📍 RGB axes = Reference frame at box center")
-    print(f"  ⚫ Gray points = LiDAR point cloud")
-    print(f"{'='*80}\n")
     
     # Create visualization window
     vis = o3d.visualization.Visualizer()
@@ -375,29 +348,29 @@ def visualize(lidar_points, gt_boxes, pred_boxes, sample_idx=0):
         height=900
     )
     
-    # Add geometries
     for geom in geometries:
         vis.add_geometry(geom)
     
     # Set camera view
     ctr = vis.get_view_control()
-    ctr.set_zoom(0.4)
+    ctr.set_zoom(0.3)
     ctr.set_front([0.3, 0, -0.95])
-    ctr.set_lookat(box_center.tolist())
+    ctr.set_lookat(center.tolist())
     ctr.set_up([0, 0, 1])
     
-    print(f"🎥 Camera positioned at: {box_center}")
-    print(f"📺 Opening window...\n")
-    
-    if len(pred_boxes) > 0 and len(gt_boxes) > 0:
-        gt_center = gt_boxes[:, :3].mean(axis=0)
-        pred_center = pred_boxes[:, :3].mean(axis=0)
-        dist = np.linalg.norm(gt_center - pred_center)
-        
-        if dist > 50:
-            print(f"⚠️  If you see RED boxes far from GREEN boxes:")
-            print(f"   This is a coordinate mismatch issue in the model")
-            print(f"   Check the diagnostic output above for details\n")
+    print(f"\n🎥 Camera positioned at: {center}")
+    print(f"📺 Opening window...")
+    print(f"\nLEGEND:")
+    print(f"  🟢 GREEN boxes = Ground Truth ({len(gt_boxes)} boxes)")
+    print(f"  🔴 RED boxes = Model Predictions ({len(pred_boxes)} boxes)")
+    print(f"  ⚫ Gray points = LiDAR point cloud")
+    print(f"  📍 RGB axes = Coordinate frame")
+    print(f"\nCONTROLS:")
+    print(f"  - LEFT CLICK + DRAG: Rotate")
+    print(f"  - SCROLL: Zoom")
+    print(f"  - RIGHT CLICK + DRAG: Pan")
+    print(f"  - Press 'Q': Close")
+    print(f"{'='*80}\n")
     
     vis.run()
     vis.destroy_window()
@@ -407,10 +380,7 @@ def visualize(lidar_points, gt_boxes, pred_boxes, sample_idx=0):
 
 if __name__ == "__main__":
     print("="*80)
-    print("3D DETECTION VISUALIZATION WITH COMPLETE DIAGNOSTICS")
-    print("="*80)
-    print(f"Checkpoint: {CHECKPOINT_PATH}")
-    print(f"Root Dir: {ROOT_DIR}")
+    print("3D DETECTION VISUALIZATION WITH FIXED COORDINATES")
     print("="*80)
     
     # Load and predict
@@ -426,8 +396,6 @@ if __name__ == "__main__":
         print(f"{'='*80}")
         print(f"Ground Truth: {len(gt_boxes)} boxes")
         print(f"Predictions: {len(pred_boxes)} boxes")
-        if len(scores) > 0:
-            print(f"Confidence: mean={scores.mean():.3f}, max={scores.max():.3f}")
         
         if len(pred_boxes) > 0 and len(gt_boxes) > 0:
             gt_center = gt_boxes[:, :3].mean(axis=0)
@@ -435,17 +403,16 @@ if __name__ == "__main__":
             distance = np.linalg.norm(gt_center - pred_center)
             
             print(f"\nCoordinate Check:")
-            print(f"  GT center: [{gt_center[0]:.1f}, {gt_center[1]:.1f}, {gt_center[2]:.1f}]")
-            print(f"  Pred center: [{pred_center[0]:.1f}, {pred_center[1]:.1f}, {pred_center[2]:.1f}]")
+            print(f"  GT center: [{gt_center[0]:.1f}, {gt_center[1]:.1f}]")
+            print(f"  Pred center: [{pred_center[0]:.1f}, {pred_center[1]:.1f}]")
             print(f"  Distance: {distance:.1f}m")
             
-            if distance > 50:
-                print(f"\n⚠️  COORDINATE MISMATCH DETECTED!")
-                print(f"  The model predictions are in wrong coordinate system")
-                print(f"  This needs to be fixed in decode_boxes or anchor generation")
-            elif distance < 5:
-                print(f"\n✅  Predictions are very close to GT!")
-                print(f"  Model is learning well!")
+            if distance < 10:
+                print(f"\n✅ SUCCESS: Predictions align with GT!")
+                print(f"  The coordinate system is now correct!")
+            else:
+                print(f"\n⚠️  Still some misalignment: {distance:.1f}m")
+                print(f"  May need to adjust anchor sizes or training parameters")
         
         print(f"{'='*80}\n")
     else:
