@@ -62,6 +62,8 @@ def bev_iou(boxes1, boxes2):
     M = boxes2.shape[0]
     
     # Extract BEV parameters (x, y, w, l)
+    # NOTE: boxes are [x, y, z, h, w, l, rot] in LiDAR coords (X=forward, Y=left).
+    # In BEV, the extent along X is length (l) and along Y is width (w).
     x1, y1 = boxes1[:, 0], boxes1[:, 1]
     w1, l1 = boxes1[:, 4], boxes1[:, 5]
     
@@ -87,9 +89,9 @@ def bev_iou(boxes1, boxes2):
     
     # Compute intersection (axis-aligned approximation)
     x_overlap = torch.max(torch.zeros_like(x1), 
-                         torch.min(x1 + w1/2, x2 + w2/2) - torch.max(x1 - w1/2, x2 - w2/2))
+                         torch.min(x1 + l1/2, x2 + l2/2) - torch.max(x1 - l1/2, x2 - l2/2))
     y_overlap = torch.max(torch.zeros_like(y1),
-                         torch.min(y1 + l1/2, y2 + l2/2) - torch.max(y1 - l1/2, y2 - l2/2))
+                         torch.min(y1 + w1/2, y2 + w2/2) - torch.max(y1 - w1/2, y2 - w2/2))
     
     intersection = x_overlap * y_overlap
     union = area1 + area2 - intersection
@@ -155,11 +157,13 @@ class AnchorGenerator:
         else:
             H, W = self.feature_map_size
         
-        # Create grid centers in WORLD coordinates
-        x_range = torch.linspace(self.point_cloud_range[0], 
-                                self.point_cloud_range[3], W, device=device)
-        y_range = torch.linspace(self.point_cloud_range[1], 
-                                self.point_cloud_range[4], H, device=device)
+        # Create grid centers in WORLD coordinates.
+        # Use cell centers (not endpoints) to avoid systematic half-cell offsets.
+        x_min, y_min, _, x_max, y_max, _ = self.point_cloud_range
+        x_step = (x_max - x_min) / float(W)
+        y_step = (y_max - y_min) / float(H)
+        x_range = x_min + (torch.arange(W, device=device, dtype=torch.float32) + 0.5) * x_step
+        y_range = y_min + (torch.arange(H, device=device, dtype=torch.float32) + 0.5) * y_step
         
         # FIX: Use 'xy' indexing - X varies along width, Y along height
         # This matches LiDAR convention: X=forward, Y=left
@@ -342,6 +346,13 @@ class RPNLoss(nn.Module):
         labels = torch.full((anchors.shape[0],), -1, device=anchors.device, dtype=torch.long)
         labels[max_ious < self.neg_iou_thresh] = 0  # Negative
         labels[max_ious >= self.pos_iou_thresh] = 1  # Positive
+
+        # Force at least one positive anchor per GT (standard RPN safeguard).
+        gt_best_ious, gt_best_anchor_idx = ious.max(dim=0)  # (M,), (M,)
+        labels[gt_best_anchor_idx] = 1
+        max_indices[gt_best_anchor_idx] = torch.arange(
+            gt_boxes.shape[0], device=anchors.device, dtype=max_indices.dtype
+        )
         
         # 🔍 DEBUG: Print label counts
         num_pos = (labels == 1).sum().item()
@@ -349,8 +360,11 @@ class RPNLoss(nn.Module):
         num_ignore = (labels == -1).sum().item()
         print(f"       Positive: {num_pos}, Negative: {num_neg}, Ignored: {num_ignore}")
         
-        if num_pos == 0:
-            print(f"       ⚠️  ZERO POSITIVE ANCHORS! Max IoU ({max_ious.max().item():.4f}) < threshold ({self.pos_iou_thresh})")
+        print(f"       Forced GT positives: {len(gt_boxes)} (best anchor per GT)")
+        print(
+            f"       GT-best IoU min/med/max: "
+            f"{gt_best_ious.min().item():.4f}/{gt_best_ious.median().item():.4f}/{gt_best_ious.max().item():.4f}"
+        )
         
         # Assign target boxes
         target_boxes = gt_boxes[max_indices]

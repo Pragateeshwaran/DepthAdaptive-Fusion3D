@@ -9,17 +9,47 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import spconv.pytorch as spconv
-
+import logging
+from datetime import datetime
 # Import corrected modules
 from lidar_model import LiDARFeatureExtractor
 from radar_model import RadarFeatureExtractor
 from image_model import ImageFeatureExtractor
 from rpn_refinement import TwoStageDetector, parse_label_line
 from cross_attention import FusionModule
-
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data_loader import get_LiDAR, get_radar, get_images, get_labels, get_calib
+
+# ============ LOGGING SETUP ============
+def setup_logger(log_dir=r'F:\Work\DeepLearning\Research\logs'):
+    """Setup logger that writes to both console and file."""
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_path = os.path.join(log_dir, f'training_{timestamp}.log')
+    
+    logger = logging.getLogger('training')
+    logger.setLevel(logging.DEBUG)
+    
+    # File handler
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.DEBUG)
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    logger.info(f"Log file: {log_path}")
+    return logger
+
+logger = setup_logger()
 
 # ============ CRITICAL FIX #2: Coordinate Transformation ============
 def transform_boxes_camera_to_lidar(boxes_camera, calib):
@@ -28,14 +58,26 @@ def transform_boxes_camera_to_lidar(boxes_camera, calib):
         return boxes_camera
     
     Tr_velo_to_cam = calib.get('Tr_velo_to_cam', np.eye(4))
+    R0_rect = calib.get('R0_rect', np.eye(3))
     
     if Tr_velo_to_cam.shape == (12,):
         Tr_velo_to_cam = Tr_velo_to_cam.reshape(3, 4)
         Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
     elif Tr_velo_to_cam.shape == (3, 4):
         Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
+
+    if R0_rect.shape == (9,):
+        R0_rect = R0_rect.reshape(3, 3)
+    if R0_rect.shape == (3, 3):
+        R0_4x4 = np.eye(4, dtype=np.float32)
+        R0_4x4[:3, :3] = R0_rect
+    elif R0_rect.shape == (4, 4):
+        R0_4x4 = R0_rect
+    else:
+        R0_4x4 = np.eye(4, dtype=np.float32)
     
-    Tr_cam_to_velo = np.linalg.inv(Tr_velo_to_cam)
+    # Labels are in rectified camera coordinates, so include R0_rect.
+    Tr_cam_to_velo = np.linalg.inv(R0_4x4 @ Tr_velo_to_cam)
     boxes_lidar = np.zeros_like(boxes_camera, dtype=np.float32)
     
     for i in range(len(boxes_camera)):
@@ -54,20 +96,16 @@ def transform_boxes_camera_to_lidar(boxes_camera, calib):
         boxes_lidar[i, 6] = rot_lidar
     
     return boxes_lidar
-
 # ============ ROOT CAUSE FIX: Force spconv to use specific algorithm ============
 import os
 os.environ['SPCONV_ALGO_MODE'] = 'default'  
 os.environ['SPCONV_DISABLE_CONV_CACHE'] = '0'  # Enable cache
-
 import torch.backends.cudnn as cudnn
 cudnn.benchmark = False
 cudnn.deterministic = True
-
+logger.info("🔧 ROOT CAUSE FIX: Forcing spconv to use native algorithm...")
 print("🔧 ROOT CAUSE FIX: Forcing spconv to use native algorithm...")
-
 # ============ Checkpoint Management ============
-
 def find_latest_checkpoint(checkpoint_dir='.'):
     """Find the latest checkpoint file."""
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*.pth'))
@@ -87,12 +125,11 @@ def find_latest_checkpoint(checkpoint_dir='.'):
     
     latest_epoch, latest_file = max(epochs, key=lambda x: x[0])
     return latest_file, latest_epoch
-
-
 def load_checkpoint(model, optimizer, checkpoint_path, device):
     """Load checkpoint and return starting epoch."""
     print(f"\n{'='*70}")
     print(f"📂 Loading checkpoint: {checkpoint_path}")
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
@@ -102,15 +139,14 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     
     print(f"✓ Resumed from epoch {checkpoint['epoch']}")
     print(f"✓ Previous loss: {checkpoint['loss']:.4f}")
+    logger.info(f"Resumed from epoch {checkpoint['epoch']}, previous loss: {checkpoint['loss']:.4f}")
     if 'loss_stats' in checkpoint:
         print(f"✓ Previous stats: {checkpoint['loss_stats']}")
+        logger.info(f"Previous stats: {checkpoint['loss_stats']}")
     print(f"{'='*70}\n")
     
     return start_epoch
-
-
 # ============ PROPER VOXELIZATION - NO DOWNSAMPLING, NO SKIPPING ============
-
 def voxelize_lidar_proper(points_batch, 
                           voxel_size=(0.1, 0.1, 0.1),  # Original resolution
                           point_cloud_range=(-50, -50, -3, 50, 50, 5)):  # Original range
@@ -196,8 +232,6 @@ def voxelize_lidar_proper(points_batch,
     voxel_coords = torch.cat(voxel_coords_list, dim=0)
     
     return voxel_features, voxel_coords, spatial_shape, len(points_batch)
-
-
 def voxelize_radar_proper(points_batch, 
                           voxel_size=(0.2, 0.2, 0.2),  # Original resolution
                           point_cloud_range=(-50, -50, -3, 50, 50, 5)):
@@ -278,14 +312,10 @@ def voxelize_radar_proper(points_batch,
     voxel_coords = torch.cat(voxel_coords_list, dim=0)
     
     return voxel_features, voxel_coords, spatial_shape, len(points_batch)
-
-
 # ============ Function Aliases for Backward Compatibility ============
 # These aliases allow visualize_predictions.py to import the functions
 voxelize_lidar = voxelize_lidar_proper
 voxelize_radar = voxelize_radar_proper
-
-
 def prepare_images(image_batch):
     """Batch image preparation."""
     images_tensor = []
@@ -299,36 +329,6 @@ def prepare_images(image_batch):
         images_tensor.append(img_tensor)
     
     return torch.stack(images_tensor)
-
-
-def transform_boxes_camera_to_lidar(boxes_camera, calib):
-    """Transform boxes from camera coordinates to LiDAR coordinates."""
-    if len(boxes_camera) == 0:
-        return boxes_camera
-    
-    Tr_velo_to_cam = calib.get('Tr_velo_to_cam', np.eye(4))
-    
-    if Tr_velo_to_cam.shape == (12,):
-        Tr_velo_to_cam = Tr_velo_to_cam.reshape(3, 4)
-        Tr_velo_to_cam = np.vstack([Tr_velo_to_cam, [0, 0, 0, 1]])
-    
-    Tr_cam_to_velo = np.linalg.inv(Tr_velo_to_cam)
-    
-    boxes_lidar = boxes_camera.copy()
-    
-    for i in range(len(boxes_camera)):
-        x_cam, y_cam, z_cam = boxes_camera[i, 0:3]
-        point_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-        point_lidar = Tr_cam_to_velo @ point_cam
-        boxes_lidar[i, 0:3] = point_lidar[:3]
-        
-        rot_cam = boxes_camera[i, 6]
-        rot_lidar = -rot_cam - np.pi / 2
-        boxes_lidar[i, 6] = rot_lidar
-    
-    return boxes_lidar
-
-
 def parse_labels_to_targets(labels_batch, calib_batch=None):
     """Parse labels and transform to LiDAR coordinates."""
     targets = []
@@ -357,6 +357,9 @@ def parse_labels_to_targets(labels_batch, calib_batch=None):
                 boxes_lidar = transform_boxes_camera_to_lidar(boxes_camera, calib_batch[idx])
             else:
                 boxes_lidar = boxes_camera
+
+            # KITTI-style labels use z at object bottom; detector regresses z at box center.
+            boxes_lidar[:, 2] = boxes_lidar[:, 2] + 0.5 * boxes_lidar[:, 3]
             
             targets.append({
                 'boxes_3d': torch.tensor(boxes_lidar, dtype=torch.float32),
@@ -371,16 +374,14 @@ def parse_labels_to_targets(labels_batch, calib_batch=None):
             })
     
     return targets
-
-
 # ============ Dataset ============
-
 class V2XRadarDataset(Dataset):
     def __init__(self, root_dir, split='training', num_samples=None):
         self.root_dir = root_dir
         self.split = split
         
         print(f"Loading {split} data...")
+        logger.info(f"Loading {split} data...")
         
         self.lidar_data = get_LiDAR(root_dir, split, from_idx=0, count=num_samples)
         self.radar_data = get_radar(root_dir, split, from_idx=0, count=num_samples)
@@ -396,6 +397,7 @@ class V2XRadarDataset(Dataset):
         self.calibs = self.calibs[:min_len]  # FIX: Also limit calibrations
         
         print(f"Loaded {len(self)} samples")
+        logger.info(f"Loaded {len(self)} samples")
     
     def __len__(self):
         return len(self.lidar_data)
@@ -406,11 +408,9 @@ class V2XRadarDataset(Dataset):
             'radar': self.radar_data[idx],
             'image': self.image_data[idx],
             'label': self.labels[idx],
-            'calib': self.calibs[idx],  # FIX: Include calibration
+            'calib': self.calibs[idx],   
             'idx': idx
         }
-
-
 def collate_fn(batch):
     """Custom collate function."""
     return {
@@ -418,13 +418,10 @@ def collate_fn(batch):
         'radar': [item['radar'] for item in batch],
         'image': [item['image'] for item in batch],
         'label': [item['label'] for item in batch],
-        'calib': [item['calib'] for item in batch],  # FIX: Include calibrations
+        'calib': [item['calib'] for item in batch],   
         'idx': [item['idx'] for item in batch]
     }
-
-
 # ============ Multi-Modal Detection Network ============
-
 class MultiModalDetectionNetwork(nn.Module):
     def __init__(self, lidar_dim=128, radar_dim=128, image_dim=128):
         super(MultiModalDetectionNetwork, self).__init__()
@@ -483,10 +480,7 @@ class MultiModalDetectionNetwork(nn.Module):
             'depth_threshold': depth_threshold,
             'detections': detection_outputs
         }
-
-
 # ============ Loss Functions ============
-
 class DetectionLoss(nn.Module):
     def __init__(self):
         super(DetectionLoss, self).__init__()
@@ -520,10 +514,7 @@ class DetectionLoss(nn.Module):
                 'num_pos_anchors': 0,
                 'total_loss': 0.0
             }
-
-
 # ============ NO-SKIP Training Loop ============
-
 def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, root_dir):
     """
     NO-SKIP training loop - processes EVERY batch without exceptions.
@@ -547,6 +538,7 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         # Should never be None
         if lidar_result is None or radar_result is None:
             print(f"\n❌ FATAL: Voxelization returned None for batch {batch_idx}")
+            logger.error(f"FATAL: Voxelization returned None for batch {batch_idx}")
             continue
         
         lidar_feat, lidar_coords, lidar_shape, lidar_bs = lidar_result
@@ -582,10 +574,12 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         # 🔍 DEBUG: Check what we're getting
         print(f"\n🔍 DEBUG Batch {len(batch['label'])} samples:")
         print(f"   Calib batch length: {len(batch['calib'])}")
+        logger.debug(f"Batch {batch_idx}: {len(batch['label'])} samples, calib length: {len(batch['calib'])}")
         if len(batch['calib']) > 0:
             print(f"   First calib type: {type(batch['calib'][0])}")
             if isinstance(batch['calib'][0], dict):
                 print(f"   First calib keys: {list(batch['calib'][0].keys())}")
+                logger.debug(f"First calib keys: {list(batch['calib'][0].keys())}")
         
         targets = parse_labels_to_targets(batch['label'], batch['calib'])  # FIX: Use batch['calib']
         
@@ -594,6 +588,7 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
             boxes = t['boxes_3d']
             if len(boxes) > 0:
                 print(f"   Target {i}: {len(boxes)} boxes, X=[{boxes[:, 0].min():.1f},{boxes[:, 0].max():.1f}], Y=[{boxes[:, 1].min():.1f},{boxes[:, 1].max():.1f}]")
+                logger.debug(f"Target {i}: {len(boxes)} boxes, X=[{boxes[:, 0].min():.1f},{boxes[:, 0].max():.1f}], Y=[{boxes[:, 1].min():.1f},{boxes[:, 1].max():.1f}]")
         for t in targets:
             t['boxes_3d'] = t['boxes_3d'].to(device)
             t['labels'] = t['labels'].to(device)
@@ -623,6 +618,12 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
             loss_stats[k] += loss_dict[k]
         # conf_loss removed
         num_batches += 1
+
+        logger.debug(
+            f"Epoch {epoch} Batch {batch_idx}: loss={total_loss_batch.item():.4f} "
+            f"cls={loss_dict['rpn_cls_loss']:.4f} reg={loss_dict['rpn_reg_loss']:.4f} "
+            f"pos={loss_dict['num_pos_anchors']} voxels={len(lidar_feat)}"
+        )
         
         pbar.set_postfix({
             'loss': f'{total_loss_batch.item():.4f}',
@@ -638,23 +639,31 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
         loss_stats[k] = loss_stats[k] / num_batches if num_batches > 0 else 0
     
     return avg_loss, loss_stats
-
-
 def main():
     # IMPROVED Configuration for Better Accuracy
     ROOT_DIR = r'F:\Work\DeepLearning\Research\V2X-Radar-V'
     BATCH_SIZE = 2              # OPTIMIZED for RTX 3060 12GB (was 4 - too large!)
-    NUM_EPOCHS = 100            # IMPROVED: Increased from 50 (model needs more training!)
-    LEARNING_RATE = 1e-4        # IMPROVED: Reduced from 5e-4 (more stable convergence)
-    NUM_SAMPLES = 500           # IMPROVED: Increased from 100 (more training data!)
+    LEARNING_RATE = 1           # IMPROVED: Reduced from 5e-4 (more stable convergence)
     WEIGHT_DECAY = 1e-4         # NEW: L2 regularization to prevent overfitting
+    
+    # Fast sanity retrain (aligned transforms)
+    SANITY_RUN = True
+    if SANITY_RUN:
+        NUM_EPOCHS = 200
+        NUM_SAMPLES = 50
+    else:
+        NUM_EPOCHS = 200        # IMPROVED: Increased from 50 (model needs more training!)
+        NUM_SAMPLES = 500       # IMPROVED: Increased from 100 (more training data!)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
+    logger.info(f"Device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA Version: {torch.version.cuda}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}, CUDA: {torch.version.cuda}, "
+                    f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
     print(f"\n{'='*70}")
     print("IMPROVED TRAINING CONFIGURATION")
@@ -665,6 +674,8 @@ def main():
     print(f"Batch Size: {BATCH_SIZE} (optimized for {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
     print(f"Weight Decay: {WEIGHT_DECAY} (new)")
     print(f"{'='*70}\n")
+    logger.info(f"Config — Epochs: {NUM_EPOCHS}, Samples: {NUM_SAMPLES}, LR: {LEARNING_RATE}, "
+                f"Batch: {BATCH_SIZE}, WeightDecay: {WEIGHT_DECAY}")
     
     NUM_WORKERS = 0
     
@@ -691,6 +702,7 @@ def main():
     
     print("✓ Using AdamW optimizer with weight decay")
     print("✓ Using Cosine Annealing LR scheduler")
+    logger.info("Optimizer: AdamW | Scheduler: CosineAnnealingLR")
     
     # Checkpoint loading
     start_epoch = 1
@@ -699,14 +711,18 @@ def main():
     if checkpoint_info is not None:
         checkpoint_path, checkpoint_epoch = checkpoint_info
         print(f"\n✓ Found checkpoint: {checkpoint_path}")
+        logger.info(f"Found checkpoint: {checkpoint_path}")
         
         start_epoch = load_checkpoint(model, optimizer, checkpoint_path, device)
         for _ in range(checkpoint_epoch):
             scheduler.step()
     else:
         print("\nNo checkpoint found. Starting fresh training...")
+        logger.info("No checkpoint found. Starting fresh training.")
     
-    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel parameters: {num_params:,}")
+    logger.info(f"Model parameters: {num_params:,}")
     print("\n🎯 ROOT CAUSE FIX APPLIED:")
     print("  ✓ spconv algorithm mode: NATIVE (no auto-tune)")
     print("  ✓ NO downsampling - all points processed")
@@ -720,6 +736,7 @@ def main():
     train_losses = []
     
     print(f"Starting training from epoch {start_epoch}...\n")
+    logger.info(f"Starting training from epoch {start_epoch}")
     
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
         train_loss, loss_stats = train_one_epoch(model, train_loader, optimizer, 
@@ -730,18 +747,25 @@ def main():
         #     continue
         
         train_losses.append(train_loss)
-
         print(f"\nEpoch {epoch}/{NUM_EPOCHS} - Loss: {train_loss:.4f}")
         print(f"  RPN CLS: {loss_stats['rpn_cls_loss']:.4f} | "
               f"RPN REG: {loss_stats['rpn_reg_loss']:.4f} | "
               f"Pos Anchors: {loss_stats['num_pos_anchors']:.1f}")
+        logger.info(
+            f"Epoch {epoch}/{NUM_EPOCHS} — Loss: {train_loss:.4f} | "
+            f"RPN CLS: {loss_stats['rpn_cls_loss']:.4f} | "
+            f"RPN REG: {loss_stats['rpn_reg_loss']:.4f} | "
+            f"Pos Anchors: {loss_stats['num_pos_anchors']:.1f} | "
+            f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        )
         
         scheduler.step()
         
         # Save checkpoint
-        if epoch % 20 == 0 or epoch==100:
+        if epoch   or epoch==100:
             print(f"\n{'='*70}")
             print(f"💾 Saving checkpoint at epoch {epoch}...")
+            logger.info(f"Saving checkpoint at epoch {epoch}...")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -753,6 +777,7 @@ def main():
             }, f'checkpoint_epoch_{epoch}.pth')
             print(f"✓ Saved checkpoint_epoch_{epoch}.pth")
             print(f"{'='*70}\n")
+            logger.info(f"Saved checkpoint_epoch_{epoch}.pth")
     
     # Save final model
     torch.save({
@@ -764,6 +789,7 @@ def main():
         'train_losses': train_losses
     }, 'final_model.pth')
     print("\n✓ Saved final model to final_model.pth")
+    logger.info("Saved final model to final_model.pth")
     
     # Plot
     if len(train_losses) > 0:
@@ -777,9 +803,9 @@ def main():
         plt.grid(True)
         plt.savefig('training_curve.png')
         print("✓ Saved training curve to training_curve.png")
+        logger.info("Saved training curve to training_curve.png")
     
     print("\n✓ Training complete!")
-
-
+    logger.info("Training complete!")
 if __name__ == "__main__":
     main()
