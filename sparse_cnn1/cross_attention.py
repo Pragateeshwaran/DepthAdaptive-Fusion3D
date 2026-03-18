@@ -14,7 +14,9 @@ class SparseCrossAttention(nn.Module):
                  lidar_dim=128, 
                  radar_dim=128, 
                  num_heads=8, 
-                 dropout=0.1):
+                 dropout=0.1,
+                 max_radar_tokens=2048,
+                 query_chunk_size=1024):
         super(SparseCrossAttention, self).__init__()
         
         assert lidar_dim % num_heads == 0
@@ -25,6 +27,8 @@ class SparseCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = lidar_dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.max_radar_tokens = max_radar_tokens
+        self.query_chunk_size = query_chunk_size
         
         # Use SPARSE 3D CONVOLUTIONS for Q, K, V projections
         self.q_proj = SubMConv3d(lidar_dim, lidar_dim, 1, bias=False, indice_key='q_proj')
@@ -37,7 +41,7 @@ class SparseCrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.BatchNorm1d(lidar_dim)
     
-    def sparse_attention(self, Q_features, K_features, V_features, batch_size, max_q=4096, max_kv=1024):
+    def sparse_attention(self, Q_features, K_features, V_features, batch_size):
         """
         Compute attention ONLY on sparse features (memory efficient).
         
@@ -52,55 +56,35 @@ class SparseCrossAttention(nn.Module):
         """
         N, C = Q_features.shape
         M = K_features.shape[0]
-
-        if N == 0:
-            return Q_features
-        if M == 0:
-            return Q_features
-
-        q_idx = None
-        kv_idx = None
-        q_input_features = Q_features
-
-        if N > max_q:
-            q_idx = torch.randperm(N, device=Q_features.device)[:max_q]
-            Q_features = Q_features[q_idx]
-
-        if M > max_kv:
-            kv_idx = torch.randperm(M, device=K_features.device)[:max_kv]
-            K_features = K_features[kv_idx]
-            V_features = V_features[kv_idx]
-
-        N_q = Q_features.shape[0]
-        M_kv = K_features.shape[0]
         
         # Reshape for multi-head: (N, C) -> (N, num_heads, head_dim)
-        Q = Q_features.view(N_q, self.num_heads, self.head_dim)
-        K = K_features.view(M_kv, self.num_heads, self.head_dim)
-        V = V_features.view(M_kv, self.num_heads, self.head_dim)
+        Q = Q_features.view(N, self.num_heads, self.head_dim)
+        K = K_features.view(M, self.num_heads, self.head_dim)
+        V = V_features.view(M, self.num_heads, self.head_dim)
         
         # Transpose for attention: (N, num_heads, head_dim) -> (num_heads, N, head_dim)
         Q = Q.transpose(0, 1)  # (num_heads, N, head_dim)
         K = K.transpose(0, 1)  # (num_heads, M, head_dim)
         V = V.transpose(0, 1)  # (num_heads, M, head_dim)
         
-        # Scaled dot-product attention: (num_heads, N, head_dim) @ (num_heads, head_dim, M)
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (num_heads, N, M)
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention: (num_heads, N, M) @ (num_heads, M, head_dim) -> (num_heads, N, head_dim)
-        attn_output = torch.matmul(attn_weights, V)
+        # Chunked attention to avoid huge (N x M) memory usage.
+        outputs = []
+        for q_start in range(0, N, self.query_chunk_size):
+            q_end = min(q_start + self.query_chunk_size, N)
+            q_chunk = Q[:, q_start:q_end, :]  # (num_heads, Qc, head_dim)
+
+            attn_scores = torch.matmul(q_chunk, K.transpose(-2, -1)) * self.scale  # (num_heads, Qc, M)
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            out_chunk = torch.matmul(attn_weights, V)  # (num_heads, Qc, head_dim)
+            outputs.append(out_chunk)
+
+        attn_output = torch.cat(outputs, dim=1)
         
         # Reshape back: (num_heads, N, head_dim) -> (N, num_heads, head_dim) -> (N, C)
-        attn_output = attn_output.transpose(0, 1).contiguous().view(N_q, C)
-
-        if q_idx is None:
-            return attn_output
-
-        full_output = q_input_features.clone()
-        full_output[q_idx] = attn_output
-        return full_output
+        attn_output = attn_output.transpose(0, 1).contiguous().view(N, C)
+        
+        return attn_output
     
     def forward(self, lidar_feat_sparse, radar_feat_sparse, lidar_conf_sparse, radar_conf_sparse):
         """
@@ -130,6 +114,13 @@ class SparseCrossAttention(nn.Module):
         Q_features = Q_sparse.features  # (N_lidar, C)
         K_features = K_sparse.features  # (N_radar, C)
         V_features = V_sparse.features  # (N_radar, C)
+
+        # Keep only the strongest radar tokens to control quadratic attention cost.
+        if K_features.shape[0] > self.max_radar_tokens:
+            radar_scores = radar_conf_sparse.features.squeeze(-1)
+            top_idx = torch.topk(radar_scores, k=self.max_radar_tokens, sorted=False).indices
+            K_features = K_features[top_idx]
+            V_features = V_features[top_idx]
         
         batch_size = lidar_feat_sparse.batch_size
         
@@ -158,10 +149,22 @@ class ATGN(nn.Module):
     Extracts point cloud density information and generates a depth threshold
     to divide point clouds for differential fusion at different depths.
     """
-    def __init__(self, feature_dim=128, radius=2.0):
+    def __init__(
+        self,
+        feature_dim=128,
+        radius=2.0,
+        threshold_method='range_percentile',
+        range_percentile=0.60,
+        threshold_min=10.0,
+        threshold_max=50.0,
+    ):
         super(ATGN, self).__init__()
         
         self.radius = radius  # Radius for density calculation
+        self.threshold_method = threshold_method
+        self.range_percentile = range_percentile
+        self.threshold_min = threshold_min
+        self.threshold_max = threshold_max
         
         # MLP for density feature extraction and threshold generation
         self.density_mlp = nn.Sequential(
@@ -185,13 +188,32 @@ class ATGN(nn.Module):
         )
     
     def compute_density(self, points):
-        """Compute density by coarse voxel point counts (O(N log N))."""
-        voxel_size = 2.0
-        coords = torch.floor(points / voxel_size).long()
-        _, inverse, counts = torch.unique(
-            coords, dim=0, return_inverse=True, return_counts=True
-        )
-        density = counts[inverse].float().unsqueeze(1)
+        """Compute volume density for all points."""
+        N = points.shape[0]
+        device = points.device
+        
+        # Compute pairwise distances (using batched approach for memory efficiency)
+        batch_size = 1000  # Process 1000 points at a time
+        densities = []
+        
+        for i in range(0, N, batch_size):
+            end_idx = min(i + batch_size, N)
+            batch_points = points[i:end_idx]  # (B, 3)
+            
+            # Compute distances to all other points
+            dists = torch.norm(batch_points.unsqueeze(1) - points.unsqueeze(0), dim=2)
+            
+            # Count points within radius
+            num_neighbors = (dists <= self.radius).sum(dim=1).float()  # (B,)
+            
+            # Volume density = number of points / volume of sphere
+            volume = (4.0 / 3.0) * 3.14159 * (self.radius ** 3)
+            batch_density = num_neighbors / volume  # (B,)
+            
+            densities.append(batch_density)
+        
+        density = torch.cat(densities, dim=0).unsqueeze(1)  # (N, 1)
+        
         return density
     
     def generate_threshold(self, density):
@@ -206,6 +228,26 @@ class ATGN(nn.Module):
         threshold = 10.0 + threshold * 40.0  # Range: [10, 50]
         
         return threshold.squeeze()
+
+    def generate_threshold_from_range(self, points):
+        """
+        Fast adaptive threshold from range distribution.
+        Works for both metric points and voxel-index points.
+        """
+        if points is None or points.numel() == 0:
+            return torch.tensor(35.0, device=self.density_mlp[0].weight.device)
+
+        points = points.float()
+        if points.shape[1] >= 2:
+            ranges = torch.norm(points[:, :2], dim=1)
+        else:
+            ranges = torch.abs(points[:, 0])
+
+        if ranges.numel() == 0:
+            return torch.tensor(35.0, device=points.device)
+
+        q = torch.quantile(ranges, self.range_percentile)
+        return torch.clamp(q, min=self.threshold_min, max=self.threshold_max)
     
     def forward(self, features_sparse, points=None):
         """
@@ -219,10 +261,12 @@ class ATGN(nn.Module):
             gated_features: SparseConvTensor with gated features
             depth_threshold: scalar tensor
         """
-        # Generate threshold if points provided
-        if points is not None:
+        # Generate threshold using selected method.
+        if self.threshold_method == 'density' and points is not None:
             density = self.compute_density(points)
             depth_threshold = self.generate_threshold(density)
+        elif points is not None:
+            depth_threshold = self.generate_threshold_from_range(points)
         else:
             depth_threshold = torch.tensor(35.0, device=features_sparse.features.device)
         
@@ -307,29 +351,30 @@ class FusionModule(nn.Module):
         image_weighted = image_feat * image_conf  # (B, C, H, W)
         
         # Step 2: Process image
-        image_feat_processed = self.image_to_3d(image_weighted)  # (B, C, H, W)
+        image_feat_3d = self.image_to_3d(image_weighted)  # (B, C, H, W)
         
         # Step 3: Get LiDAR spatial shape
         spatial_shape = lidar_sparse.spatial_shape  # [D, H, W]
-        _, H_lidar, W_lidar = spatial_shape
+        D, H_lidar, W_lidar = spatial_shape
         
         # Step 4: Resize to match LiDAR BEV
         if (H_img != H_lidar) or (W_img != W_lidar):
-            image_feat_processed = F.interpolate(
-                image_feat_processed,
-                size=(H_lidar, W_lidar),
-                mode='bilinear',
-                align_corners=False,
-            )
-
-        # Step 5: Sample directly from 2D map with sparse (batch, y, x) indices
-        image_feat_hw = image_feat_processed.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+            image_feat_3d = F.interpolate(image_feat_3d, size=(H_lidar, W_lidar), 
+                                          mode='bilinear', align_corners=False)
+        
+        # Step 5: Expand to 3D by replicating along Z
+        image_feat_3d = image_feat_3d.unsqueeze(2)  # (B, C, 1, H, W)
+        image_feat_3d = image_feat_3d.expand(-1, -1, D, -1, -1)  # (B, C, D, H, W)
+        
+        # Step 6: Sample at LiDAR's sparse locations
+        image_feat_3d_flat = image_feat_3d.permute(0, 2, 3, 4, 1).contiguous()  # (B, D, H, W, C)
         
         batch_indices = lidar_sparse.indices[:, 0]
+        z_indices = lidar_sparse.indices[:, 1]
         y_indices = lidar_sparse.indices[:, 2]
         x_indices = lidar_sparse.indices[:, 3]
-
-        image_features_sparse = image_feat_hw[batch_indices, y_indices, x_indices]
+        
+        image_features_sparse = image_feat_3d_flat[batch_indices, z_indices, y_indices, x_indices]
         
         # ⭐ CRITICAL FIX: Weight by (1 - lidar_conf) as per architecture diagram
         # This implements the multiplication with (1 - WL) for image features
@@ -356,18 +401,22 @@ class FusionModule(nn.Module):
             image_conf: Tensor (B, 1, H, W)
             original_points: (N, 3) original LiDAR points for density calculation
         """
-        # Velocity gate from radar feature channel index 3.
-        # This suppresses stationary clutter and emphasizes moving targets.
+        # Step 1: Doppler velocity gate using radar feature channel index 3.
         if radar_feat_sparse.features.shape[1] > 3:
             velocity_channel = radar_feat_sparse.features[:, 3]
-            vel_gate = torch.sigmoid(velocity_channel).unsqueeze(1)
-            radar_gated = radar_feat_sparse.features * vel_gate
-            radar_feat_sparse = radar_feat_sparse.replace_feature(radar_gated)
-
-        # Step 1: Cross-attention (Q=LiDAR*(1-WL), K/V=Radar*WR)
+        else:
+            velocity_channel = torch.zeros(
+                radar_feat_sparse.features.shape[0],
+                device=radar_feat_sparse.features.device,
+                dtype=radar_feat_sparse.features.dtype
+            )
+        vel_gate = torch.sigmoid(velocity_channel).unsqueeze(1)
+        radar_gated_sparse = radar_feat_sparse.replace_feature(
+            radar_feat_sparse.features * vel_gate
+        )
         enhanced_lidar_sparse = self.cross_attention(
-            lidar_feat_sparse, 
-            radar_feat_sparse,
+            lidar_feat_sparse,
+            radar_gated_sparse,
             lidar_conf_sparse,
             radar_conf_sparse
         )

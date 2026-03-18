@@ -39,38 +39,135 @@ def encode_boxes(boxes, anchors):
     return torch.stack([dx, dy, dz, dh, dw, dl, drot], dim=-1)
 
 
+def _boxes_to_bev_corners(boxes):
+    """Convert [x, y, z, h, w, l, rot] boxes to BEV corners (N, 4, 2)."""
+    if boxes.numel() == 0:
+        return boxes.new_zeros((0, 4, 2))
+
+    x = boxes[:, 0]
+    y = boxes[:, 1]
+    w = boxes[:, 4]
+    l = boxes[:, 5]
+    rot = boxes[:, 6]
+
+    template = boxes.new_tensor([
+        [0.5, 0.5],
+        [0.5, -0.5],
+        [-0.5, -0.5],
+        [-0.5, 0.5],
+    ])
+
+    corners_local = template.unsqueeze(0).repeat(boxes.shape[0], 1, 1)
+    corners_local[:, :, 0] = corners_local[:, :, 0] * l.unsqueeze(1)
+    corners_local[:, :, 1] = corners_local[:, :, 1] * w.unsqueeze(1)
+
+    cos_r = torch.cos(rot)
+    sin_r = torch.sin(rot)
+
+    x_local = corners_local[:, :, 0]
+    y_local = corners_local[:, :, 1]
+
+    x_rot = x_local * cos_r.unsqueeze(1) - y_local * sin_r.unsqueeze(1)
+    y_rot = x_local * sin_r.unsqueeze(1) + y_local * cos_r.unsqueeze(1)
+
+    corners = torch.stack([x_rot + x.unsqueeze(1), y_rot + y.unsqueeze(1)], dim=-1)
+    return corners
+
+
+def _cross_2d(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _is_inside(point, edge_start, edge_end):
+    return _cross_2d(edge_end - edge_start, point - edge_start) >= 0.0
+
+
+def _line_intersection(p1, p2, a, b):
+    r = p2 - p1
+    s = b - a
+    denom = _cross_2d(r, s)
+    eps = p1.new_tensor(1e-8)
+    t = _cross_2d(a - p1, s) / (denom + torch.sign(denom) * eps + (denom == 0).float() * eps)
+    return p1 + t * r
+
+
+def _polygon_clip(subject_polygon, clip_polygon):
+    """Sutherland-Hodgman polygon clipping for convex polygons in pure PyTorch."""
+    if subject_polygon.shape[0] == 0:
+        return subject_polygon
+
+    output = subject_polygon
+    for i in range(clip_polygon.shape[0]):
+        input_list = output
+        if input_list.shape[0] == 0:
+            break
+
+        edge_start = clip_polygon[i]
+        edge_end = clip_polygon[(i + 1) % clip_polygon.shape[0]]
+        new_points = []
+
+        prev_point = input_list[-1]
+        prev_inside = _is_inside(prev_point, edge_start, edge_end)
+
+        for curr_point in input_list:
+            curr_inside = _is_inside(curr_point, edge_start, edge_end)
+
+            if curr_inside:
+                if not bool(prev_inside):
+                    new_points.append(_line_intersection(prev_point, curr_point, edge_start, edge_end))
+                new_points.append(curr_point)
+            elif bool(prev_inside):
+                new_points.append(_line_intersection(prev_point, curr_point, edge_start, edge_end))
+
+            prev_point = curr_point
+            prev_inside = curr_inside
+
+        if len(new_points) == 0:
+            output = subject_polygon.new_zeros((0, 2))
+        else:
+            output = torch.stack(new_points, dim=0)
+
+    return output
+
+
+def _polygon_area(poly):
+    if poly.shape[0] < 3:
+        return poly.new_tensor(0.0)
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return 0.5 * torch.abs(torch.sum(x * torch.roll(y, shifts=-1) - y * torch.roll(x, shifts=-1)))
+
+
 def bev_iou(boxes1, boxes2):
-    """Fully vectorized axis-aligned BEV IoU using broadcasting."""
+    """
+    Rotation-aware BEV IoU using polygon clipping in pure PyTorch.
+    Returns IoU matrix of shape (N, M).
+    """
     N = boxes1.shape[0]
     M = boxes2.shape[0]
     if N == 0 or M == 0:
         return boxes1.new_zeros((N, M))
-    x1, y1, w1, l1 = boxes1[:, 0], boxes1[:, 1], boxes1[:, 4], boxes1[:, 5]
-    x2, y2, w2, l2 = boxes2[:, 0], boxes2[:, 1], boxes2[:, 4], boxes2[:, 5]
 
-    x1 = x1.unsqueeze(1)
-    y1 = y1.unsqueeze(1)
-    w1 = w1.unsqueeze(1)
-    l1 = l1.unsqueeze(1)
-    x2 = x2.unsqueeze(0)
-    y2 = y2.unsqueeze(0)
-    w2 = w2.unsqueeze(0)
-    l2 = l2.unsqueeze(0)
+    corners1 = _boxes_to_bev_corners(boxes1)
+    corners2 = _boxes_to_bev_corners(boxes2)
 
-    inter_x = torch.clamp(
-        torch.min(x1 + l1 / 2.0, x2 + l2 / 2.0) - torch.max(x1 - l1 / 2.0, x2 - l2 / 2.0),
-        min=0.0,
-    )
-    inter_y = torch.clamp(
-        torch.min(y1 + w1 / 2.0, y2 + w2 / 2.0) - torch.max(y1 - w1 / 2.0, y2 - w2 / 2.0),
-        min=0.0,
-    )
-    inter = inter_x * inter_y
+    area1 = boxes1[:, 4] * boxes1[:, 5]
+    area2 = boxes2[:, 4] * boxes2[:, 5]
 
-    area1 = (boxes1[:, 4] * boxes1[:, 5]).unsqueeze(1)
-    area2 = (boxes2[:, 4] * boxes2[:, 5]).unsqueeze(0)
-    union = area1 + area2 - inter
-    return inter / (union + 1e-6)
+    ious = boxes1.new_zeros((N, M))
+    eps = boxes1.new_tensor(1e-6)
+
+    for i in range(N):
+        poly1 = corners1[i]
+        a1 = area1[i]
+        for j in range(M):
+            poly2 = corners2[j]
+            inter_poly = _polygon_clip(poly1, poly2)
+            inter_area = _polygon_area(inter_poly)
+            union = a1 + area2[j] - inter_area
+            ious[i, j] = inter_area / (union + eps)
+
+    return ious
 
 
 def nms_bev(boxes, scores, iou_threshold=0.5):

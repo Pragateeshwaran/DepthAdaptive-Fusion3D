@@ -37,7 +37,7 @@ class SparseCrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.BatchNorm1d(lidar_dim)
     
-    def sparse_attention(self, Q_features, K_features, V_features, batch_size, max_q=4096, max_kv=1024):
+    def sparse_attention(self, Q_features, K_features, V_features, batch_size):
         """
         Compute attention ONLY on sparse features (memory efficient).
         
@@ -52,32 +52,11 @@ class SparseCrossAttention(nn.Module):
         """
         N, C = Q_features.shape
         M = K_features.shape[0]
-
-        if N == 0:
-            return Q_features
-        if M == 0:
-            return Q_features
-
-        q_idx = None
-        kv_idx = None
-        q_input_features = Q_features
-
-        if N > max_q:
-            q_idx = torch.randperm(N, device=Q_features.device)[:max_q]
-            Q_features = Q_features[q_idx]
-
-        if M > max_kv:
-            kv_idx = torch.randperm(M, device=K_features.device)[:max_kv]
-            K_features = K_features[kv_idx]
-            V_features = V_features[kv_idx]
-
-        N_q = Q_features.shape[0]
-        M_kv = K_features.shape[0]
         
         # Reshape for multi-head: (N, C) -> (N, num_heads, head_dim)
-        Q = Q_features.view(N_q, self.num_heads, self.head_dim)
-        K = K_features.view(M_kv, self.num_heads, self.head_dim)
-        V = V_features.view(M_kv, self.num_heads, self.head_dim)
+        Q = Q_features.view(N, self.num_heads, self.head_dim)
+        K = K_features.view(M, self.num_heads, self.head_dim)
+        V = V_features.view(M, self.num_heads, self.head_dim)
         
         # Transpose for attention: (N, num_heads, head_dim) -> (num_heads, N, head_dim)
         Q = Q.transpose(0, 1)  # (num_heads, N, head_dim)
@@ -93,14 +72,9 @@ class SparseCrossAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, V)
         
         # Reshape back: (num_heads, N, head_dim) -> (N, num_heads, head_dim) -> (N, C)
-        attn_output = attn_output.transpose(0, 1).contiguous().view(N_q, C)
-
-        if q_idx is None:
-            return attn_output
-
-        full_output = q_input_features.clone()
-        full_output[q_idx] = attn_output
-        return full_output
+        attn_output = attn_output.transpose(0, 1).contiguous().view(N, C)
+        
+        return attn_output
     
     def forward(self, lidar_feat_sparse, radar_feat_sparse, lidar_conf_sparse, radar_conf_sparse):
         """
@@ -185,13 +159,32 @@ class ATGN(nn.Module):
         )
     
     def compute_density(self, points):
-        """Compute density by coarse voxel point counts (O(N log N))."""
-        voxel_size = 2.0
-        coords = torch.floor(points / voxel_size).long()
-        _, inverse, counts = torch.unique(
-            coords, dim=0, return_inverse=True, return_counts=True
-        )
-        density = counts[inverse].float().unsqueeze(1)
+        """Compute volume density for all points."""
+        N = points.shape[0]
+        device = points.device
+        
+        # Compute pairwise distances (using batched approach for memory efficiency)
+        batch_size = 1000  # Process 1000 points at a time
+        densities = []
+        
+        for i in range(0, N, batch_size):
+            end_idx = min(i + batch_size, N)
+            batch_points = points[i:end_idx]  # (B, 3)
+            
+            # Compute distances to all other points
+            dists = torch.norm(batch_points.unsqueeze(1) - points.unsqueeze(0), dim=2)
+            
+            # Count points within radius
+            num_neighbors = (dists <= self.radius).sum(dim=1).float()  # (B,)
+            
+            # Volume density = number of points / volume of sphere
+            volume = (4.0 / 3.0) * 3.14159 * (self.radius ** 3)
+            batch_density = num_neighbors / volume  # (B,)
+            
+            densities.append(batch_density)
+        
+        density = torch.cat(densities, dim=0).unsqueeze(1)  # (N, 1)
+        
         return density
     
     def generate_threshold(self, density):
@@ -307,29 +300,30 @@ class FusionModule(nn.Module):
         image_weighted = image_feat * image_conf  # (B, C, H, W)
         
         # Step 2: Process image
-        image_feat_processed = self.image_to_3d(image_weighted)  # (B, C, H, W)
+        image_feat_3d = self.image_to_3d(image_weighted)  # (B, C, H, W)
         
         # Step 3: Get LiDAR spatial shape
         spatial_shape = lidar_sparse.spatial_shape  # [D, H, W]
-        _, H_lidar, W_lidar = spatial_shape
+        D, H_lidar, W_lidar = spatial_shape
         
         # Step 4: Resize to match LiDAR BEV
         if (H_img != H_lidar) or (W_img != W_lidar):
-            image_feat_processed = F.interpolate(
-                image_feat_processed,
-                size=(H_lidar, W_lidar),
-                mode='bilinear',
-                align_corners=False,
-            )
-
-        # Step 5: Sample directly from 2D map with sparse (batch, y, x) indices
-        image_feat_hw = image_feat_processed.permute(0, 2, 3, 1).contiguous()  # (B, H, W, C)
+            image_feat_3d = F.interpolate(image_feat_3d, size=(H_lidar, W_lidar), 
+                                          mode='bilinear', align_corners=False)
+        
+        # Step 5: Expand to 3D by replicating along Z
+        image_feat_3d = image_feat_3d.unsqueeze(2)  # (B, C, 1, H, W)
+        image_feat_3d = image_feat_3d.expand(-1, -1, D, -1, -1)  # (B, C, D, H, W)
+        
+        # Step 6: Sample at LiDAR's sparse locations
+        image_feat_3d_flat = image_feat_3d.permute(0, 2, 3, 4, 1).contiguous()  # (B, D, H, W, C)
         
         batch_indices = lidar_sparse.indices[:, 0]
+        z_indices = lidar_sparse.indices[:, 1]
         y_indices = lidar_sparse.indices[:, 2]
         x_indices = lidar_sparse.indices[:, 3]
-
-        image_features_sparse = image_feat_hw[batch_indices, y_indices, x_indices]
+        
+        image_features_sparse = image_feat_3d_flat[batch_indices, z_indices, y_indices, x_indices]
         
         # ⭐ CRITICAL FIX: Weight by (1 - lidar_conf) as per architecture diagram
         # This implements the multiplication with (1 - WL) for image features

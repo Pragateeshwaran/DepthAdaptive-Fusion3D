@@ -9,3 +9,5 @@
 /sparse
 /models
 /checkpoint_*.pth
+/*.pth
+/*.pt

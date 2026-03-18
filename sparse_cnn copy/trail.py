@@ -38,13 +38,6 @@ def log_epoch_line(line, log_path=LOG_FILE):
     print(line)
 
 
-def zero_map_stats():
-    return {
-        '0.5': {'Car': 0.0, 'Pedestrian': 0.0, 'Cyclist': 0.0, 'mAP': 0.0},
-        '0.7': {'Car': 0.0, 'Pedestrian': 0.0, 'Cyclist': 0.0, 'mAP': 0.0},
-    }
-
-
 # ============ CRITICAL FIX #2: Coordinate Transformation ============
 def transform_boxes_camera_to_lidar(boxes_camera, calib):
     """Transform 3D boxes from camera to LiDAR coordinates."""
@@ -174,9 +167,7 @@ def voxelize_lidar_proper(points_batch,
                       voxel_coords[:, 1].astype(np.int64) * spatial_shape[2] +
                       voxel_coords[:, 2].astype(np.int64))
 
-        unique_hash, first_indices, inverse = np.unique(
-            voxel_hash, return_index=True, return_inverse=True
-        )
+        unique_hash, inverse = np.unique(voxel_hash, return_inverse=True)
         num_voxels = len(unique_hash)
 
         voxel_features = np.zeros((num_voxels, 3), dtype=np.float32)
@@ -186,7 +177,10 @@ def voxelize_lidar_proper(points_batch,
         voxel_counts = np.bincount(inverse, minlength=num_voxels).astype(np.float32)
         voxel_features = voxel_features / (voxel_counts[:, np.newaxis] + np.float32(1e-8))
 
-        unique_coords = voxel_coords[first_indices]
+        unique_coords = np.zeros((num_voxels, 3), dtype=np.int32)
+        for i, h in enumerate(unique_hash):
+            idx = np.where(voxel_hash == h)[0][0]
+            unique_coords[i] = voxel_coords[idx]
 
         batch_indices = np.full((num_voxels, 1), batch_idx, dtype=np.int32)
         voxel_coords_with_batch = np.concatenate([batch_indices, unique_coords], axis=1)
@@ -245,9 +239,7 @@ def voxelize_radar_proper(points_batch,
                       voxel_coords[:, 1].astype(np.int64) * spatial_shape[2] +
                       voxel_coords[:, 2].astype(np.int64))
 
-        unique_hash, first_indices, inverse = np.unique(
-            voxel_hash, return_index=True, return_inverse=True
-        )
+        unique_hash, inverse = np.unique(voxel_hash, return_inverse=True)
         num_voxels = len(unique_hash)
 
         voxel_features = np.zeros((num_voxels, 5), dtype=np.float32)
@@ -264,7 +256,10 @@ def voxelize_radar_proper(points_batch,
         voxel_counts = np.bincount(inverse, minlength=num_voxels).astype(np.float32)
         voxel_features[:, :4] = voxel_features[:, :4] / (voxel_counts[:, np.newaxis] + np.float32(1e-8))
 
-        unique_coords = voxel_coords[first_indices]
+        unique_coords = np.zeros((num_voxels, 3), dtype=np.int32)
+        for i, h in enumerate(unique_hash):
+            idx = np.where(voxel_hash == h)[0][0]
+            unique_coords[i] = voxel_coords[idx]
 
         batch_indices = np.full((num_voxels, 1), batch_idx, dtype=np.int32)
         voxel_coords_with_batch = np.concatenate([batch_indices, unique_coords], axis=1)
@@ -480,13 +475,16 @@ class DetectionLoss(nn.Module):
 
 
 # ============ Training Loop ============
-def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, compute_map_this_epoch=False):
+def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch):
     model.train()
     start_time = time.time()
 
     total_loss = 0.0
     loss_stats = {'rpn_cls_loss': 0.0, 'rpn_reg_loss': 0.0, 'rpn_multi_cls_loss': 0.0, 'num_pos_anchors': 0.0, 'total_loss': 0.0}
     num_batches = 0
+
+    epoch_predictions = []
+    epoch_targets = []
 
     for batch in dataloader:
         original_points_list = [torch.from_numpy(lidar).float()[:, :3] for lidar in batch['lidar']]
@@ -547,83 +545,27 @@ def train_one_epoch(model, dataloader, optimizer, det_criterion, device, epoch, 
                 loss_stats[k] += float(loss_dict[k])
         num_batches += 1
 
+        detections = outputs['detections']
+        proposals = detections.get('proposals', [])
+        scores = detections.get('scores', [])
+        labels = detections.get('proposal_labels', [])
+
+        for i in range(len(targets)):
+            pred_boxes = proposals[i].detach().cpu() if i < len(proposals) else torch.zeros((0, 7))
+            pred_scores = scores[i].detach().cpu() if i < len(scores) else torch.zeros((0,))
+            pred_labels = labels[i].detach().cpu().long() if i < len(labels) else torch.zeros((0,), dtype=torch.long)
+
+            epoch_predictions.append({'boxes': pred_boxes, 'scores': pred_scores, 'labels': pred_labels})
+            epoch_targets.append({
+                'boxes': targets[i]['boxes_3d'].detach().cpu(),
+                'labels': targets[i]['labels'].detach().cpu().long(),
+            })
+
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     for k in loss_stats:
         loss_stats[k] = loss_stats[k] / num_batches if num_batches > 0 else 0.0
 
-    if compute_map_this_epoch:
-        model.eval()
-        eval_predictions = []
-        eval_targets = []
-        with torch.no_grad():
-            for batch in dataloader:
-                lidar_result = voxelize_lidar_proper(batch['lidar'])
-                radar_result = voxelize_radar_proper(batch['radar'])
-
-                lidar_feat, lidar_coords, lidar_shape, lidar_bs = lidar_result
-                radar_feat, radar_coords, radar_shape, radar_bs = radar_result
-
-                lidar_feat = lidar_feat.to(device)
-                lidar_coords = lidar_coords.to(device).int()
-                radar_feat = radar_feat.to(device)
-                radar_coords = radar_coords.to(device).int()
-
-                lidar_sparse = spconv.SparseConvTensor(
-                    features=lidar_feat,
-                    indices=lidar_coords,
-                    spatial_shape=lidar_shape,
-                    batch_size=lidar_bs,
-                )
-                radar_sparse = spconv.SparseConvTensor(
-                    features=radar_feat,
-                    indices=radar_coords,
-                    spatial_shape=radar_shape,
-                    batch_size=radar_bs,
-                )
-
-                images = prepare_images(batch['image']).to(device)
-
-                targets = parse_labels_to_targets(batch['label'], batch['calib'])
-                for t in targets:
-                    t['boxes_3d'] = t['boxes_3d'].to(device)
-                    t['labels'] = t['labels'].to(device)
-                    t['scores'] = t['scores'].to(device)
-
-                outputs = model(
-                    lidar_sparse,
-                    radar_sparse,
-                    images,
-                    targets=targets,
-                    training=False,
-                    original_lidar_points=None,
-                )
-
-                detections = outputs['detections']
-                proposals = detections.get('proposals', [])
-                scores = detections.get('scores', [])
-                labels = detections.get('proposal_labels', [])
-
-                for i in range(len(targets)):
-                    pred_boxes = proposals[i].detach().cpu() if i < len(proposals) else torch.zeros((0, 7))
-                    pred_scores = scores[i].detach().cpu() if i < len(scores) else torch.zeros((0,))
-                    pred_labels = labels[i].detach().cpu().long() if i < len(labels) else torch.zeros((0,), dtype=torch.long)
-
-                    eval_predictions.append({'boxes': pred_boxes, 'scores': pred_scores, 'labels': pred_labels})
-                    eval_targets.append({
-                        'boxes': targets[i]['boxes_3d'].detach().cpu(),
-                        'labels': targets[i]['labels'].detach().cpu().long(),
-                    })
-
-        model.train()
-
-        total_gt_boxes = sum(len(t['boxes']) for t in eval_targets)
-        if total_gt_boxes == 0:
-            map_stats = zero_map_stats()
-            print('WARNING: All GT boxes empty — coordinate transform may be failing. mAP cannot be computed.')
-        else:
-            map_stats = compute_map(eval_predictions, eval_targets, iou_thresholds=(0.5, 0.7))
-    else:
-        map_stats = zero_map_stats()
+    map_stats = compute_map(epoch_predictions, epoch_targets, iou_threshold=0.5)
     elapsed = int(time.time() - start_time)
 
     return avg_loss, loss_stats, map_stats, elapsed
@@ -633,9 +575,9 @@ def main():
     parser = argparse.ArgumentParser(description='V2X-Radar-V multimodal training')
     parser.add_argument('--root_dir', type=str, default=r'F:\Work\DeepLearning\Research\V2X-Radar-V')
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--epochs', type=int, default=2000)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--num_samples', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr', type=float, default=1.0)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--active_modalities', type=str, default='lidar,radar,image')
@@ -663,45 +605,33 @@ def main():
 
     det_criterion = DetectionLoss()
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.5)
 
     start_epoch = 1
     checkpoint_info = find_latest_checkpoint()
     if checkpoint_info is not None:
-        checkpoint_epoch, checkpoint_path = checkpoint_info
+        checkpoint_path, checkpoint_epoch = checkpoint_info
         start_epoch = load_checkpoint(model, optimizer, checkpoint_path, device)
         for _ in range(checkpoint_epoch):
             scheduler.step()
 
     train_losses = []
-    last_map = zero_map_stats()
 
     for epoch in range(start_epoch, args.epochs + 1):
-        compute_map_this_epoch = True
         train_loss, loss_stats, map_stats, epoch_seconds = train_one_epoch(
-            model, train_loader, optimizer, det_criterion, device, epoch, compute_map_this_epoch=compute_map_this_epoch
+            model, train_loader, optimizer, det_criterion, device, epoch
         )
-        if compute_map_this_epoch:
-            last_map = map_stats
 
         train_losses.append(train_loss)
-        line1 = (
-            f"Epoch {epoch} | Time {epoch_seconds}s | Loss {train_loss:.4f} | "
-            f"CLS {loss_stats['rpn_cls_loss']:.4f} | REG {loss_stats['rpn_reg_loss']:.4f}"
+        log_line = (
+            f"Epoch {epoch} | Time {epoch_seconds}s | mAP@0.5 {map_stats['mAP']:.4f} | "
+            f"Loss {train_loss:.4f} | CLS {loss_stats['rpn_cls_loss']:.4f} | REG {loss_stats['rpn_reg_loss']:.4f}"
         )
-        line2 = (
-            f"         mAP@0.5 {last_map['0.5']['mAP']:.4f}  Car {last_map['0.5']['Car']:.4f}  "
-            f"Ped {last_map['0.5']['Pedestrian']:.4f}  Cyc {last_map['0.5']['Cyclist']:.4f}"
-        )
-        line3 = (
-            f"         mAP@0.7 {last_map['0.7']['mAP']:.4f}  Car {last_map['0.7']['Car']:.4f}  "
-            f"Ped {last_map['0.7']['Pedestrian']:.4f}  Cyc {last_map['0.7']['Cyclist']:.4f}"
-        )
-        log_epoch_line(line1 + '\n' + line2 + '\n' + line3)
+        log_epoch_line(log_line)
 
         scheduler.step()
 
-        if epoch % 10 == 0 or epoch == args.epochs:
+        if epoch or epoch == 100:
             torch.save(
                 {
                     'epoch': epoch,
@@ -711,7 +641,7 @@ def main():
                     'loss': train_loss,
                     'loss_stats': loss_stats,
                     'train_losses': train_losses,
-                    'map_stats': last_map,
+                    'map_stats': map_stats,
                 },
                 f'checkpoint_epoch_{epoch}.pth',
             )
